@@ -5,10 +5,15 @@ version: '3'
 services:
   postgres:
     image: postgres:13
+    ports:
+      - "5432:5432"
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backups:/backups   # ✅ Backup folder mounted for easy access to DB dumps
 
   airflow-init:
     image: apache/airflow:2.7.0
@@ -27,6 +32,8 @@ services:
 
   airflow-webserver:
     image: apache/airflow:2.7.0
+    env_file:
+      - .env
     ports:
       - "8081:8080"
     volumes:
@@ -41,10 +48,16 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
       AIRFLOW__WEBSERVER__SECRET_KEY: 08e07aa6e1e44d592baa7a46fe9c7b5c
+      _PIP_ADDITIONAL_REQUIREMENTS: "boto3"
+      AWS_ACCESS_KEY_ID:     ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION:            ${AWS_REGION}
     command: webserver
 
   airflow-scheduler:
     image: apache/airflow:2.7.0
+    env_file:
+      - .env
     depends_on:
       - airflow-webserver
     volumes:
@@ -57,4 +70,8 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
       AIRFLOW__WEBSERVER__SECRET_KEY: 08e07aa6e1e44d592baa7a46fe9c7b5c
+      _PIP_ADDITIONAL_REQUIREMENTS: "boto3"
     command: scheduler
+
+volumes:
+  postgres_data:

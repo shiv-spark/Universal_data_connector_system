@@ -1,11 +1,20 @@
-
 import os
 import re
-import inspect
+from dotenv import load_dotenv
 
-DAGS_FOLDER = "E:\\Universal_data_connector_system\\airflow\\dags"
+load_dotenv()
 
-VALID_CONNECTORS = {"csv", "excel", "google_sheets", "api"}
+DAGS_FOLDER = os.path.normpath(os.getenv(
+    "DAGS_FOLDER",
+    os.path.join(os.path.dirname(__file__), "..", "airflow", "dags")
+))
+
+WINDOWS_DATA_PATH      = os.getenv("WINDOWS_DATA_PATH",      "").replace("\\", "/")
+WINDOWS_DATASET_PATH   = os.getenv("WINDOWS_DATASET_PATH",   "").replace("\\", "/")
+CONTAINER_DATA_PATH    = os.getenv("CONTAINER_DATA_PATH",    "/opt/airflow/user_data")
+CONTAINER_DATASET_PATH = os.getenv("CONTAINER_DATASET_PATH", "/opt/airflow/dataset")
+
+VALID_CONNECTORS = {"csv", "excel", "google_sheets", "api", "postgres", "s3"}  
 VALID_OPTIONS    = {"1", "2", "3"}
 
 
@@ -54,6 +63,37 @@ def validate_pipeline_config(config: dict) -> list:
     if ct == "api" and not config.get("api_url"):
         errors.append("api: api_url required.")
 
+    # ── Incremental validation ───────────────────────────
+    sync_mode = config.get("sync_mode", "full")
+    if sync_mode not in ("full", "incremental"):
+        errors.append("sync_mode 'full' will be 'incremental' only.")
+
+    if sync_mode == "incremental" and not config.get("incremental_column"):
+        errors.append("incremental: incremental_column required — e.g. 'updated_at' or 'id'")
+    # ────────────────────────────────────────────────────
+
+    # ── Postgres validation ──────────────────────────────
+    if ct == "postgres":
+        if not config.get("src_pg_host"):
+            errors.append("postgres: src_pg_host required.")
+        if not config.get("src_pg_db"):
+            errors.append("postgres: src_pg_db required.")
+        if not config.get("src_pg_user"):
+            errors.append("postgres: src_pg_user required.")
+        if not config.get("src_pg_password"):
+            errors.append("postgres: src_pg_password required.")
+        if not config.get("pg_query"):
+            errors.append("postgres: pg_query required.")
+    # ────────────────────────────────────────────────────
+
+    # ── S3 validation ────────────────────────────────────
+    if ct == "s3":
+        if not config.get("s3_bucket"):
+            errors.append("s3: s3_bucket required.")
+        if not config.get("s3_key"):
+            errors.append("s3: s3_key required.")
+    # ────────────────────────────────────────────────────
+
     if config.get("option", "1") not in VALID_OPTIONS:
         errors.append("option '1' (append), '2' (overwrite), or '3' (create new) required.")
 
@@ -82,6 +122,26 @@ def _render_template(cfg: dict) -> str:
     sheet_url       = cfg.get("sheet_url") or None
     api_url         = cfg.get("api_url") or None
 
+    # ── Incremental variables ────────────────────────────
+    sync_mode          = cfg.get("sync_mode")          or "full"
+    incremental_column = cfg.get("incremental_column") or None
+    # ────────────────────────────────────────────────────
+
+    # ── Postgres variables ───────────────────────────────
+    src_pg_host     = cfg.get("src_pg_host")     or None
+    src_pg_db       = cfg.get("src_pg_db")       or None
+    src_pg_user     = cfg.get("src_pg_user")     or None
+    src_pg_password = cfg.get("src_pg_password") or None
+    src_pg_port     = cfg.get("src_pg_port")     or "5432"
+    pg_query        = cfg.get("pg_query")        or None
+    # ────────────────────────────────────────────────────
+
+    # ── S3 variables ─────────────────────────────────────
+    s3_bucket    = cfg.get("s3_bucket")    or None
+    s3_key       = cfg.get("s3_key")       or None
+    s3_file_type = cfg.get("s3_file_type") or "csv"
+    # ────────────────────────────────────────────────────
+
     def q(val):
         return f'"{val}"' if val is not None else "None"
 
@@ -100,24 +160,42 @@ def _render_template(cfg: dict) -> str:
         f"FILE_PATH       = {q(file_path)}",
         f"SHEET_URL       = {q(sheet_url)}",
         f"API_URL         = {q(api_url)}",
+        # ── Incremental ──────────────────────────────────
+        f'SYNC_MODE          = "{sync_mode}"',
+        f"INCREMENTAL_COLUMN = {q(incremental_column)}",
+        # ────────────────────────────────────────────────
+        # ── Postgres ────────────────────────────────────
+        f"SRC_PG_HOST     = {q(src_pg_host)}",
+        f"SRC_PG_DB       = {q(src_pg_db)}",
+        f"SRC_PG_USER     = {q(src_pg_user)}",
+        f"SRC_PG_PASSWORD = {q(src_pg_password)}",
+        f'SRC_PG_PORT     = "{src_pg_port}"',
+        f"PG_QUERY        = {q(pg_query)}",
+        # ── S3 ──────────────────────────────────────────
+        f"S3_BUCKET       = {q(s3_bucket)}",
+        f"S3_KEY          = {q(s3_key)}",
+        f'S3_FILE_TYPE    = "{s3_file_type}"',
+        # ────────────────────────────────────────────────
         f'OPTION          = "{option}"',
         f"AFTER_FIRST_RUN = {q(after_first_run)}",
         f'TABLE_NAME      = "{table_name}"',
         f'SCHEDULE        = "{schedule}"',
         "",
-        'BASE_URL         = "http://host.docker.internal:8000"',
-        'CONTAINER_PATH   = "/opt/airflow/user_data"',
-        'WINDOWS_PATH     = "E:\\\\\\\\Universal_data_connector_system\\\\\\\\data"',
-        'DATASET_BASE_WIN = "E:\\\\\\\\Universal_data_connector_system\\\\\\\\Dataset"',
-        'DATASET_BASE_CON = "/opt/airflow/dataset"',
-        f'DATASET_PIPELINE_CON = "/opt/airflow/dataset/pipeline_{pipeline_id}"',
-        f'PIPELINE_CON_ROOT    = "/opt/airflow/user_data/pipeline_{pipeline_id}"',
+        'BASE_URL              = "http://host.docker.internal:8000"',
+        f'CONTAINER_PATH        = "{CONTAINER_DATA_PATH}"',
+        f'WINDOWS_PATH          = "{WINDOWS_DATA_PATH}"',
+        f'DATASET_BASE_WIN      = "{WINDOWS_DATASET_PATH}"',
+        f'DATASET_BASE_CON      = "{CONTAINER_DATASET_PATH}"',
+        f'DATASET_PIPELINE_CON  = "{CONTAINER_DATASET_PATH}/pipeline_{pipeline_id}"',
+        f'PIPELINE_CON_ROOT     = "{CONTAINER_DATA_PATH}/pipeline_{pipeline_id}"',
         "",
         "CONNECTOR_ENDPOINT = {",
         '    "csv":           "ingest_csv",',
         '    "excel":         "ingest_excel",',
         '    "google_sheets": "ingest_google_sheet",',
         '    "api":           "ingest_api",',
+        '    "postgres":      "ingest_postgres",',
+        '    "s3":            "ingest_s3",',          # ← added
         "}",
     ]
 
@@ -150,7 +228,7 @@ def create_dag_file(config: dict) -> dict:
 
     pipeline_id = _safe_id(config["pipeline_name"])
     filename    = f"pipeline_{pipeline_id}.py"
-    file_path   = DAGS_FOLDER.rstrip("/\\") + "\\" + filename
+    file_path   = os.path.join(DAGS_FOLDER, filename)
 
     if os.path.exists(file_path):
         return {
@@ -174,7 +252,7 @@ def create_dag_file(config: dict) -> dict:
 
 def delete_dag_file(pipeline_name: str) -> dict:
     pipeline_id = _safe_id(pipeline_name)
-    file_path   = DAGS_FOLDER.rstrip("/\\") + "\\" + f"pipeline_{pipeline_id}.py"
+    file_path   = os.path.join(DAGS_FOLDER, f"pipeline_{pipeline_id}.py")
 
     if not os.path.exists(file_path):
         return {"status": "FAILED", "error": f"Pipeline '{pipeline_id}' not found."}

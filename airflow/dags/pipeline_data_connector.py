@@ -1,3 +1,49 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+import os, json, requests, shutil
+
+# AUTO-GENERATED — pipeline: data_connector
+# Do not manually edit. Use /create_pipeline endpoint to regenerate.
+
+PIPELINE_ID     = "pipeline_data_connector"
+CONNECTOR_TYPE  = "csv"
+FOLDER_PATH     = "E:/Universal_data_connector_system/Dataset/ecom_data"
+FILE_PATH       = None
+SHEET_URL       = None
+API_URL         = None
+SYNC_MODE          = "full"
+INCREMENTAL_COLUMN = None
+SRC_PG_HOST     = None
+SRC_PG_DB       = None
+SRC_PG_USER     = None
+SRC_PG_PASSWORD = None
+SRC_PG_PORT     = "5432"
+PG_QUERY        = None
+S3_BUCKET       = None
+S3_KEY          = None
+S3_FILE_TYPE    = "csv"
+OPTION          = "1"
+AFTER_FIRST_RUN = None
+TABLE_NAME      = "tester"
+SCHEDULE        = "*/5 * * * *"
+
+BASE_URL              = "http://host.docker.internal:8000"
+CONTAINER_PATH        = "/opt/airflow/user_data"
+WINDOWS_PATH          = "E:/Universal_data_connector_system/data"
+DATASET_BASE_WIN      = "E:/Universal_data_connector_system/Dataset"
+DATASET_BASE_CON      = "/opt/airflow/dataset"
+DATASET_PIPELINE_CON  = "/opt/airflow/dataset/pipeline_data_connector"
+PIPELINE_CON_ROOT     = "/opt/airflow/user_data/pipeline_data_connector"
+
+CONNECTOR_ENDPOINT = {
+    "csv":           "ingest_csv",
+    "excel":         "ingest_excel",
+    "google_sheets": "ingest_google_sheet",
+    "api":           "ingest_api",
+    "postgres":      "ingest_postgres",
+    "s3":            "ingest_s3",
+}
 import hashlib
 import os
 from dotenv import load_dotenv
@@ -11,7 +57,7 @@ from email import encoders
 load_dotenv()
 
 DB_CONFIG = {
-    "host":     os.getenv("DB_HOST",     "postgres"),
+    "host":     os.getenv("DB_HOST",     "host.docker.internal"),
     "database": os.getenv("DB_NAME",     "postgres"),
     "user":     os.getenv("DB_USER",     "postgres"),
     "password": os.getenv("DB_PASSWORD", ""),
@@ -649,3 +695,16 @@ def _log_run_end(dag_run_id, status, error=""):
     _save_log_to_db(dag_run_id, status, log_content, log_file_path)
 
 
+
+
+with DAG(
+    dag_id            = PIPELINE_ID,
+    start_date        = datetime(2024, 1, 1),
+    schedule_interval = SCHEDULE,
+    catchup           = False,
+    tags              = ["connector", CONNECTOR_TYPE],
+) as dag:
+    PythonOperator(
+        task_id         = "run_connector",
+        python_callable = run_connector,
+    )

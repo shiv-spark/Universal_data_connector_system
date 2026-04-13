@@ -2,28 +2,40 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, Query, HTTPException
 from pydantic import BaseModel
 import psycopg2
+from psycopg2 import sql
 import requests
 import threading
 import time
 from requests.auth import HTTPBasicAuth
 from typing import Optional
 from utils.dag_generator import create_dag_file, delete_dag_file, list_dag_files
-
 from connectors.csv_connector import csv_connector
 from connectors.excel_connector import excel_connector
 from connectors.google_sheets_connector import google_sheet_connector
 from connectors.api_connector import api_connector
 from utils.ingest_runner import run_ingestion
-####################
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from dotenv import load_dotenv
+import os
+from connectors.postgres_connector import postgres_connector
+from connectors.s3_connector import s3_connector
+def _rows_to_dicts(cursor):
+    """Convert psycopg2 cursor result to list of dictionaries"""
+    columns = [desc[0] for desc in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
-EMAIL_SENDER   = "shivay999.ss@gmail.com"
-EMAIL_PASSWORD = "nmwq hybd wlrp dwkw"
-EMAIL_RECEIVER = "shivansh.s@sparkbrains.ai"
-SMTP_HOST      = "smtp.gmail.com"
-SMTP_PORT      = 587
+load_dotenv()  # loads .env into environment
+
+EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
+SMTP_HOST      = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+
+
+
 def send_failure_email(dag_id: str, run_id: str, error: str = "", status: str = "failed"):
     try:
         msg = MIMEMultipart()
@@ -65,9 +77,15 @@ app.add_middleware(
 # ─────────────────────────────────────────────
 # GLOBAL CONFIG
 # ─────────────────────────────────────────────
+AIRFLOW_BASE = os.getenv("AIRFLOW_BASE_URL", "http://airflow-webserver:8080/api/v1/dags")
 
-AIRFLOW_BASE = "http://localhost:8081/api/v1/dags"
-AIRFLOW_AUTH = HTTPBasicAuth("admin", "admin")
+# AIRFLOW_AUTH = HTTPBasicAuth("admin", "admin")
+AIRFLOW_AUTH = HTTPBasicAuth(
+    os.getenv("AIRFLOW_USER", "admin"),
+    os.getenv("AIRFLOW_PASSWORD", "admin")
+)
+
+
 
 
 DAG_MAP = {
@@ -86,14 +104,23 @@ OPTION_MAP = {
 # ─────────────────────────────────────────────
 # DB CONFIG
 # ─────────────────────────────────────────────
-
 DB_CONFIG = {
-    "host":     "localhost",
-    "database": "postgres",
-    "user":     "postgres",
-    "password": "spark@1234",
-    "port":     "5432"
+    "host":     os.getenv("DB_HOST",     "postgres"),
+    "database": os.getenv("DB_NAME",     "airflow"),
+    "user":     os.getenv("DB_USER",     "airflow"),
+    "password": os.getenv("DB_PASSWORD", "airflow"),
+    "port":     os.getenv("DB_PORT",     "5432")
 }
+
+
+# DB_CONFIG = {
+#     "host":     os.getenv("DB_HOST",     "localhost"),
+#     "database": os.getenv("DB_NAME",     "airflow"),
+#     "user":     os.getenv("DB_USER",     "airflow"),
+#     "password": os.getenv("DB_PASSWORD", "airflow"),
+#     "port":     os.getenv("DB_PORT",     "5432")
+# }
+
 
 
 def get_conn():
@@ -126,16 +153,21 @@ class CSVRequest(BaseModel):
     file_path: str
     option: str
     table_name: str | None = None
+    sync_mode:  str        = "full"
+    incremental_column: str | None = None
 
 @app.post("/ingest_csv")
 def ingest_csv(req: CSVRequest):
+    validate_inputs(req.option, req.table_name)
     return run_ingestion(
         csv_connector,
         req.file_path,
         "CSVConnector",
         req.file_path,
         option=req.option,
-        table_name=req.table_name
+        table_name=req.table_name,
+        sync_mode          = req.sync_mode,
+        incremental_column = req.incremental_column,
     )
 
 
@@ -147,19 +179,24 @@ class ExcelRequest(BaseModel):
     file_path: str
     option: str
     table_name: str | None = None
+    sync_mode:  str        = "full"
+    incremental_column: str | None = None
 
 @app.post("/ingest_excel")
 def ingest_excel(req: ExcelRequest):
-    skip = validate_inputs(req.option, req.table_name)
-    if skip:
-        return skip
+    validate_inputs(req.option, req.table_name)
+    # skip = validate_inputs(req.option, req.table_name)
+    # if skip:
+    #     return skip
     return run_ingestion(
         excel_connector,
         req.file_path,
         "ExcelConnector",
         req.file_path,
         option=req.option,
-        table_name=req.table_name
+        table_name=req.table_name,
+        sync_mode          = req.sync_mode,
+        incremental_column = req.incremental_column,
     )
 
 
@@ -171,12 +208,15 @@ class GoogleSheetRequest(BaseModel):
     sheet_url: str
     option: str
     table_name: str | None = None
+    sync_mode:  str        = "full"
+    incremental_column: str | None = None
 
 @app.post("/ingest_google_sheet")
 def ingest_google_sheet(req: GoogleSheetRequest):
-    skip = validate_inputs(req.option, req.table_name)
-    if skip:
-        return skip
+    validate_inputs(req.option, req.table_name)
+    # skip = validate_inputs(req.option, req.table_name)
+    # if skip:
+    #     return skip
     return run_ingestion(
         google_sheet_connector,
         req.sheet_url,
@@ -184,7 +224,9 @@ def ingest_google_sheet(req: GoogleSheetRequest):
         req.sheet_url,
         "pandas",
         option=req.option,
-        table_name=req.table_name
+        table_name=req.table_name,
+        sync_mode          = req.sync_mode,
+        incremental_column = req.incremental_column,
     )
 
 
@@ -196,35 +238,122 @@ class APIRequest(BaseModel):
     url: str
     option: str
     table_name: str | None = None
+    sync_mode:  str        = "full"
+    incremental_column: str | None = None
 
 @app.post("/ingest_api")
 def ingest_api(req: APIRequest):
-    skip = validate_inputs(req.option, req.table_name)
-    if skip:
-        return skip
+    validate_inputs(req.option, req.table_name)
+    # skip = validate_inputs(req.option, req.table_name)
+    # if skip:
+    #     return skip
     return run_ingestion(
         api_connector,
         req.url,
         "APIConnector",
         req.url,
         option=req.option,
-        table_name=req.table_name
+        table_name=req.table_name,
+        sync_mode          = req.sync_mode,
+        incremental_column = req.incremental_column,
     )
+
+# ─────────────────────────────────────────────
+# POSTGRES CONNECTOR
+# ────────────────────────────────────────────
+from connectors.postgres_connector import postgres_connector
+class PostgresRequest(BaseModel):
+    host: str
+    database: str
+    user: str
+    password: str
+    port: str = "5432"
+    query: str
+    option: str
+    table_name: str | None = None
+    sync_mode:  str        = "full"
+    incremental_column: str | None = None
+
+@app.post("/ingest_postgres")
+def ingest_postgres(req: PostgresRequest):
+    validate_inputs(req.option, req.table_name)
+    source = f"{req.host}/{req.database}"
+    return run_ingestion(
+        postgres_connector,
+        source,
+        "PostgresConnector",
+        req.host,
+        req.database,
+        req.user,
+        req.password,
+        req.port,
+        req.query,
+        option=req.option,
+        table_name=req.table_name,
+        sync_mode          = req.sync_mode,
+        incremental_column = req.incremental_column,
+    )
+
+
+# ─────────────────────────────────────────────
+# S3 CONNECTOR
+# ─────────────────────────────────────────────
+
+class S3Request(BaseModel):
+    bucket:     str
+    key:        str           # e.g. "folder/sales.csv"
+    file_type:  str = "csv"   # csv, xlsx, parquet, json
+    option:     str
+    table_name: str | None = None
+    sync_mode:  str        = "full"
+    incremental_column: str | None = None
+
+@app.post("/ingest_s3")
+def ingest_s3(req: S3Request):
+    validate_inputs(req.option, req.table_name)
+    source = f"s3://{req.bucket}/{req.key}"
+    return run_ingestion(
+        s3_connector,
+        source,
+        "S3Connector",
+        req.bucket,
+        req.key,
+        req.file_type,
+        option     = req.option,
+        table_name = req.table_name,
+        sync_mode          = req.sync_mode,
+        incremental_column = req.incremental_column,
+    )
+
+
+
 
 
 # ─────────────────────────────────────────────
 # PIPELINE RUNS & LOGS
 # ─────────────────────────────────────────────
 
+# @app.get("/runs")
+# def get_runs():
+#     conn = get_conn()
+#     cursor = conn.cursor()
+#     cursor.execute("SELECT * FROM pipeline_runs ORDER BY start_time DESC")
+#     data = cursor.fetchall()
+#     conn.close()
+#     return data
+
 @app.get("/runs")
 def get_runs():
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM pipeline_runs ORDER BY start_time DESC")
-    data = cursor.fetchall()
+    result = _rows_to_dicts(cursor)
     conn.close()
-    return data
+    return result
 
+@app.get("/test_dict")
+def test_dict():
+    return [{"id": 1, "name": "test"}]
 
 @app.get("/logs/{run_id}")
 def get_logs(run_id: int):
@@ -238,40 +367,6 @@ def get_logs(run_id: int):
     conn.close()
     return data
 
-
-# ─────────────────────────────────────────────
-# INSERT PIPELINE LOG
-# ─────────────────────────────────────────────
-
-# def insert_pipeline_log(data):
-#     conn = get_conn()
-#     cur = conn.cursor()
-
-#     query = """
-#     INSERT INTO airflow_pipeline_runs (
-#         dag_id, dag_run_id, connector_type, file_path,
-#         sheet_url, api_url, operation, table_name,
-#         status, execution_date
-#     )
-#     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-#     """
-
-#     cur.execute(query, (
-#         data.get("dag_id"),
-#         data.get("dag_run_id"),
-#         data.get("connector_type"),
-#         data.get("file_path") or data.get("source_path"),
-#         data.get("sheet_url"),
-#         data.get("api_url"),
-#         data.get("operation"),
-#         data.get("table_name"),
-#         data.get("status"),
-#         data.get("execution_date")
-#     ))
-
-#     conn.commit()
-#     cur.close()
-#     conn.close()
 
 def insert_pipeline_log(data):
     conn = get_conn()
@@ -414,7 +509,21 @@ class CreatePipelineRequest(BaseModel):
     file_path:       Optional[str] = None
     sheet_url:       Optional[str] = None
     api_url:         Optional[str] = None
- 
+
+    # ── Postgres fields ──────────────────
+    src_pg_host:     Optional[str] = None
+    src_pg_db:       Optional[str] = None
+    src_pg_user:     Optional[str] = None
+    src_pg_password: Optional[str] = None
+    src_pg_port:     Optional[str] = "5432"
+    pg_query:        Optional[str] = None
+    # ── S3 fields ────────────────────────
+    s3_bucket:       Optional[str] = None
+    s3_key:          Optional[str] = None
+    s3_file_type:    Optional[str] = "csv"
+    # ─── Incremental fields ─────────────────────
+    sync_mode:     Optional[str] = "full"   # "full" or "incremental"
+    incremental_column:    Optional[str] = None     # required if load_type is "incremental"
  
 
  
@@ -473,39 +582,89 @@ def list_pipelines():
         "pipelines": list_dag_files()
     }
 
+# @app.get("/table/{table_name}")
+# def get_table_data(table_name: str):
+#     conn = get_conn()
+#     cursor = conn.cursor()
+
+#     try:
+#         # Table exist check
+#         cursor.execute("""
+#             SELECT EXISTS (
+#                 SELECT FROM information_schema.tables
+#                 WHERE table_name = %s
+#             )
+#         """, (table_name,))
+#         exists = cursor.fetchone()[0]
+
+#         if not exists:
+#             raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found.")
+
+#         # Row count
+#         cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"')
+#         count = cursor.fetchone()[0]
+
+#         # Poora data
+#         cursor.execute(f'SELECT * FROM "{table_name}"')
+#         rows  = cursor.fetchall()
+#         cols  = [desc[0] for desc in cursor.description]
+#         data  = [dict(zip(cols, row)) for row in rows]
+
+#         return {
+#             "table":      table_name,
+#             "row_count":  count,
+#             "columns":    cols,
+#             "data":       data
+#         }
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+#     finally:
+#         conn.close()
+
 @app.get("/table/{table_name}")
 def get_table_data(table_name: str):
     conn = get_conn()
     cursor = conn.cursor()
 
     try:
-        # Table exist check
+        # Step 1 — validate table name format before touching the DB
+        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table_name):
+            raise HTTPException(status_code=400, detail=f"Invalid table name '{table_name}'.")
+
+        # Step 2 — parameterised existence check
         cursor.execute("""
             SELECT EXISTS (
                 SELECT FROM information_schema.tables
-                WHERE table_name = %s
+                WHERE table_schema = 'public'
+                AND table_name = %s
             )
         """, (table_name,))
         exists = cursor.fetchone()[0]
 
         if not exists:
-            raise HTTPException(status_code=404, detail=f"Table '{table_name}' nahi mili.")
+            raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found.")
 
-        # Row count
-        cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"')
+        # Step 3 — use sql.Identifier for the table name in dynamic queries
+        cursor.execute(
+            sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(table_name))
+        )
         count = cursor.fetchone()[0]
 
-        # Poora data
-        cursor.execute(f'SELECT * FROM "{table_name}"')
-        rows  = cursor.fetchall()
-        cols  = [desc[0] for desc in cursor.description]
-        data  = [dict(zip(cols, row)) for row in rows]
+        cursor.execute(
+            sql.SQL("SELECT * FROM {}").format(sql.Identifier(table_name))
+        )
+        rows = cursor.fetchall()
+        cols = [desc[0] for desc in cursor.description]
+        data = [dict(zip(cols, row)) for row in rows]
 
         return {
-            "table":      table_name,
-            "row_count":  count,
-            "columns":    cols,
-            "data":       data
+            "table":     table_name,
+            "row_count": count,
+            "columns":   cols,
+            "data":      data
         }
 
     except HTTPException:
@@ -539,7 +698,7 @@ def pause_pipeline(pipeline_name: str):
     return {
         "status":  "PAUSED",
         "dag_id":  dag_id,
-        "message": f"Pipeline '{dag_id}' pause ho gayi."
+        "message": f"Pipeline '{dag_id}' paused."
     }
 
 
@@ -883,3 +1042,173 @@ def get_pipeline_logs_by_run(pipeline_name: str, dag_run_id: str):
     finally:
         cur.close()
         conn.close()
+
+
+
+# metrics endpoint to get historical performance data for a pipeline
+
+@app.get("/metrics/{pipeline_id}")
+def get_pipeline_metrics(pipeline_id: str, limit: int = 20):
+    """Ek pipeline ki last N runs ki metrics."""
+    conn = get_conn()
+    cur  = conn.cursor()
+
+    pipeline_id = pipeline_id if pipeline_id.startswith("pipeline_") \
+                  else f"pipeline_{pipeline_id}"
+
+    cur.execute("""
+        SELECT
+            status,
+            rows_inserted,
+            rows_skipped,
+            duration_sec,
+            evolved_columns,
+            match_pct,
+            file_name,
+            error_message,
+            logged_at
+        FROM pipeline_metrics
+        WHERE pipeline_id = %s
+        ORDER BY logged_at DESC
+        LIMIT %s
+    """, (pipeline_id, limit))
+
+    rows = cur.fetchall()
+    cols = [d[0] for d in cur.description]
+    conn.close()
+
+    return {"pipeline": pipeline_id, "runs": [dict(zip(cols, r)) for r in rows]}
+
+# aggregated metrics summary for all pipelines
+@app.get("/metrics/summary/all")
+def get_all_metrics_summary():
+    """Saari pipelines ka aggregated summary."""
+    conn = get_conn()
+    cur  = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            pipeline_id,
+            connector_type,
+            COUNT(*)                                            AS total_runs,
+            SUM(rows_inserted)                                  AS total_rows,
+            ROUND(AVG(duration_sec)::numeric, 2)               AS avg_duration_sec,
+            COUNT(*) FILTER (WHERE status = 'SUCCESS')          AS success_count,
+            COUNT(*) FILTER (WHERE status = 'FAILED')           AS failed_count,
+            ROUND(AVG(match_pct)::numeric, 1)                  AS avg_match_pct,
+            MAX(logged_at)                                      AS last_run_at
+        FROM pipeline_metrics
+        GROUP BY pipeline_id, connector_type
+        ORDER BY last_run_at DESC
+    """)
+
+    rows = cur.fetchall()
+    cols = [d[0] for d in cur.description]
+    conn.close()
+
+    return {"summary": [dict(zip(cols, r)) for r in rows]}
+
+
+# ─────────────────────────────────────────────
+# Dashboard summary
+# ─────────────────────────────────────────────
+@app.get("/dashboard/summary")
+def dashboard_summary():
+    """Dashboard ke liye saara data ek jagah"""
+    conn = get_conn()
+    cur  = conn.cursor()
+
+    try:
+        # ── Metric cards ─────────────────────────────
+        cur.execute("""
+            SELECT
+                COUNT(*)                                              AS total_runs,
+                COUNT(*) FILTER (WHERE status = 'SUCCESS')           AS success,
+                COUNT(*) FILTER (WHERE status = 'FAILED')            AS failed,
+                COUNT(*) FILTER (WHERE status = 'SKIPPED')           AS skipped,
+                COALESCE(SUM(rows_inserted), 0)                      AS total_rows,
+                ROUND(AVG(duration_sec)::numeric, 2)                 AS avg_duration
+            FROM pipeline_metrics
+            WHERE logged_at >= NOW() - INTERVAL '24 hours'
+        """)
+        metrics = dict(zip([d[0] for d in cur.description], cur.fetchone()))
+
+        # ── Last 7 days runs ─────────────────────────
+        cur.execute("""
+            SELECT
+                DATE(logged_at)                                       AS day,
+                COUNT(*) FILTER (WHERE status = 'SUCCESS')           AS success,
+                COUNT(*) FILTER (WHERE status = 'FAILED')            AS failed,
+                COUNT(*) FILTER (WHERE status = 'SKIPPED')           AS skipped
+            FROM pipeline_metrics
+            WHERE logged_at >= NOW() - INTERVAL '7 days'
+            GROUP BY DATE(logged_at)
+            ORDER BY day
+        """)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        daily = [dict(zip(cols, r)) for r in rows]
+
+        # ── Connector breakdown ───────────────────────
+        cur.execute("""
+            SELECT
+                connector_type,
+                COUNT(*)                          AS runs,
+                ROUND(AVG(duration_sec)::numeric,2) AS avg_dur,
+                COALESCE(SUM(rows_inserted),0)    AS total_rows
+            FROM pipeline_metrics
+            GROUP BY connector_type
+            ORDER BY runs DESC
+        """)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        connectors = [dict(zip(cols, r)) for r in rows]
+
+        # ── Recent runs ───────────────────────────────
+        cur.execute("""
+            SELECT
+                pipeline_id,
+                connector_type,
+                status,
+                rows_inserted,
+                duration_sec,
+                logged_at
+            FROM pipeline_metrics
+            ORDER BY logged_at DESC
+            LIMIT 20
+        """)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        recent = [dict(zip(cols, r)) for r in rows]
+
+        # ── Per pipeline rows ─────────────────────────
+        cur.execute("""
+            SELECT
+                pipeline_id,
+                SUM(rows_inserted) AS total_rows
+            FROM pipeline_metrics
+            WHERE status = 'SUCCESS'
+            GROUP BY pipeline_id
+            ORDER BY total_rows DESC
+            LIMIT 10
+        """)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        pipeline_rows = [dict(zip(cols, r)) for r in rows]
+
+        return {
+            "metrics":       metrics,
+            "daily":         daily,
+            "connectors":    connectors,
+            "recent_runs":   recent,
+            "pipeline_rows": pipeline_rows,
+        }
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=False) 

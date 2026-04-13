@@ -3,6 +3,29 @@ import re
 import polars as pl
 import pandas as pd
 import numpy as np
+from psycopg2 import sql
+import time
+from psycopg2.extras import execute_values
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DB_CONFIG = {
+    "host":     os.getenv("DB_HOST",     "postgres"),
+    "database": os.getenv("DB_NAME",     "airflow"),
+    "user":     os.getenv("DB_USER",     "airflow"),
+    "password": os.getenv("DB_PASSWORD", "airflow"),
+    "port":     os.getenv("DB_PORT",     "5432"),
+}
+# DB_CONFIG = {
+#     "host":     os.getenv("DB_HOST",     "localhost"),
+#     "database": os.getenv("DB_NAME",     "postgres"),
+#     "user":     os.getenv("DB_USER",     "postgres"),
+#     "password": os.getenv("DB_PASSWORD", ""),
+#     "port":     os.getenv("DB_PORT",     "5432"),
+# }
+
 # ─────────────────────────────────────────────
 # CLEAN COLUMN NAMES
 # ─────────────────────────────────────────────
@@ -14,7 +37,6 @@ def clean_column(name):
     if re.match(r"^\d", name):
         name = f"col_{name}"
     return name or "unnamed"
-
 
 # ─────────────────────────────────────────────
 # GET SCHEMA
@@ -48,7 +70,6 @@ def dtype_to_sql(dtype: str) -> str:
     else:
         return "TEXT"
 
-
 # ─────────────────────────────────────────────
 # GET ALL TABLES
 # ─────────────────────────────────────────────
@@ -76,6 +97,7 @@ def get_table_columns(cursor, table_name):
     return [r[0] for r in cursor.fetchall()]
 
 
+
 # ─────────────────────────────────────────────
 # TABLE EXISTS CHECK
 # ─────────────────────────────────────────────
@@ -90,6 +112,7 @@ def table_exists(cursor, table_name):
     return cursor.fetchone()[0]
 
 
+
 # ─────────────────────────────────────────────
 # CREATE TABLE
 # ─────────────────────────────────────────────
@@ -100,130 +123,534 @@ def create_table(cursor, df, table_name):
     col_definitions = []
     for col, dtype in schema.items():
         sql_type   = dtype_to_sql(dtype)
-        quoted_col = f'"{col}"'
-        col_definitions.append(f'{quoted_col} {sql_type}')
+        # sql.Identifier se column aur table safely quote hote hain
+        col_definitions.append(
+            sql.SQL("{} {}").format(
+                sql.Identifier(col),
+                sql.SQL(sql_type)
+            )
+        )
 
-    col_sql       = ',\n        '.join(col_definitions)
-    quoted_table  = f'"{table_name}"'
+    create_query = sql.SQL("""
+        CREATE TABLE IF NOT EXISTS {table} (
+            {cols}
+        )
+    """).format(
+        table = sql.Identifier(table_name),
+        cols  = sql.SQL(", ").join(col_definitions)
+    )
+    try:
+        cursor.execute(create_query)
+        print(f"Table '{table_name}' created successfully")
+    except Exception as e:
+        # ── Conflict detail print karo ───────────────
+        print(f"Table create failed: {e}")
+        raise
 
-    create_query = f"""
-    CREATE TABLE IF NOT EXISTS {quoted_table} (
-        {col_sql}
-    );
-    """
-    cursor.execute(create_query)
-    print(f"✅ Table '{table_name}' created successfully")
+
+
+# ─────────────────────────────────────────────
+# CHECK SCHEMA MISMATCH
+# ─────────────────────────────────────────────
+def check_schema_mismatch(cursor, df, table_name):
+    cursor.execute("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = %s AND table_schema = 'public'
+    """, (table_name,))
+    existing_cols = set(row[0] for row in cursor.fetchall())
+    incoming_cols = set(df.columns)
+
+    missing_in_file = existing_cols - incoming_cols
+    extra_in_file   = incoming_cols - existing_cols
+    matched         = existing_cols & incoming_cols
+
+    match_pct = round(len(matched) / len(existing_cols) * 100, 2) if existing_cols else 100.0
+
+    print(f"Matched   : {sorted(matched)}")
+    print(f"Missing   : {sorted(missing_in_file)}  → NULL will be inserted")
+    print(f"Extra     : {sorted(extra_in_file)}  → new columns will be added")
+    print(f"Match %   : {match_pct}%")
+
+    if match_pct < 50:
+        print(f"WARNING: Only {match_pct}% columns match — filling many NULLs and adding many new columns may indicate a wrong file or bad mapping. Please verify.")
+
+    return {
+        "matched":         sorted(matched),
+        "missing_in_file": sorted(missing_in_file),
+        "extra_in_file":   sorted(extra_in_file),
+        "match_pct":       match_pct
+    }
+
+
+
 
 
 # ─────────────────────────────────────────────
 # INSERT DATA
 # ─────────────────────────────────────────────
 
-def insert_data(cursor, df, table_name):
+
+def insert_data(cursor, df, table_name, batch_size=1000):
     if isinstance(df, pl.DataFrame):
         pdf = df.to_pandas()
     else:
         pdf = df
 
-    quoted_cols   = [f'"{c}"' for c in pdf.columns]
-    cols          = ', '.join(quoted_cols)
-    placeholders  = ', '.join(['%s'] * len(pdf.columns))
-    quoted_table  = f'"{table_name}"'
+    # Safely quoted columns or table
+    cols_sql = sql.SQL(", ").join(
+        sql.Identifier(c) for c in pdf.columns
+    )
+    insert_query = sql.SQL(
+        "INSERT INTO {table} ({cols}) VALUES %s"
+    ).format(
+        table = sql.Identifier(table_name),
+        cols  = cols_sql
+    )
 
-    insert_query = f'INSERT INTO {quoted_table} ({cols}) VALUES ({placeholders})'
-
-    rows_inserted = 0
-    for row in pdf.itertuples(index=False, name=None):
-        clean_row = tuple(
-            None if (val is None or (isinstance(val, float) and np.isnan(val)))
-            else val.item() if isinstance(val, (np.integer, np.floating))
-            else str(val) if isinstance(val, np.bool_)
-            else val
-            for val in row
+    # Prepare a list of rows for execute_values
+    rows = [
+        tuple(
+            None if (v is None or (isinstance(v, float) and np.isnan(v)))
+            else bool(v) if isinstance(v, np.bool_)
+            else v.item() if isinstance(v, (np.integer, np.floating))
+            else v
+            for v in row
         )
-        cursor.execute(insert_query, clean_row)
-        rows_inserted += 1
+        for row in pdf.itertuples(index=False, name=None)
+    ]
 
-    print(f"✅ {rows_inserted} rows inserted into '{table_name}'")
+    # Insert execute values in batches for better performance and memory efficiency
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i : i + batch_size]
+        execute_values(cursor, insert_query, batch, page_size=batch_size)
+        print(f"Inserted rows {i+1} to {min(i+batch_size, len(rows))}")
 
+    print(f"{len(rows)} rows inserted into '{table_name}'")
+
+
+# ─────────────────────────────────────────────
+# Schema evolution 
+# (for option=1 append, if new columns detected then alter table to add them before insert)
+# ────────────────────────────────────────────
+def evolve_schema(cursor, df, table_name):
+    cursor.execute("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = %s AND table_schema = 'public'
+    """, (table_name,))
+    existing_cols   = {row[0] for row in cursor.fetchall()}
+    incoming_schema = get_schema(df)
+
+    added = []
+    for col, dtype in incoming_schema.items():
+        if col not in existing_cols:
+            sql_type = dtype_to_sql(dtype)
+            # ALTER TABLE bhi safely banao
+            alter_query = sql.SQL(
+                "ALTER TABLE {table} ADD COLUMN {col} {type}"
+            ).format(
+                table = sql.Identifier(table_name),
+                col   = sql.Identifier(col),
+                type  = sql.SQL(sql_type)
+            )
+            cursor.execute(alter_query)
+            added.append(col)
+            print(f"New column added: '{col}' ({sql_type})")
+
+    if added:
+        print(f"Schema evolved — {len(added)} column(s) added: {added}")
+    else:
+        print("Schema unchanged.")
+
+    return added
+
+# ────────────────────────────────────────────  
+# Observability: Log pipeline metrics to a separate table
+# ────────────────────────────────────────────
+def log_pipeline_metrics(
+                        pipeline_id,
+                        table_name,
+                        rows_inserted=0,
+                        rows_skipped=0,
+                        rows_failed=0,
+                        duration_sec=0.0,
+                        evolved_columns=None,
+                        match_pct=100.0,
+                        file_name=None,
+                        connector_type=None,
+                        option=None,
+                        status="SUCCESS",
+                        error_message=None
+                    ):
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO pipeline_metrics (
+                pipeline_id, table_name, rows_inserted, rows_skipped,
+                rows_failed, duration_sec, evolved_columns, match_pct,
+                file_name, connector_type, option, status, error_message
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            pipeline_id,
+            table_name,
+            rows_inserted,
+            rows_skipped,
+            rows_failed,
+            round(duration_sec, 2),
+            evolved_columns or [],
+            match_pct,
+            file_name,
+            connector_type,
+            option,
+            status,
+            error_message
+        ))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print(f"Metrics logged — {rows_inserted} rows | {duration_sec:.2f}s | {status}")
+    except Exception as e:
+        print(f"Metrics log failed: {e}")  # if metrics logging will fail, it should not break the main pipeline
+
+
+# ─────────────────────────────────────────────
+# VALIDATE TABLE NAME
+# ─────────────────────────────────────────────
+def validate_table_name(table_name: str):
+    """
+    Only allow alphanumeric and underscore.
+    Reject any special character.
+    """
+    if not table_name:
+        raise ValueError("table_name will be required for all connector types in future, so please provide a valid table_name in your config. It should contain only letters, numbers, and underscores, and must start with a letter or underscore.")
+
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table_name):
+        raise ValueError(
+            f"Invalid table_name '{table_name}' — "
+            f"only letters, numbers, and underscores are allowed"
+        )
+
+    if len(table_name) > 63:   # PostgreSQL limit
+        raise ValueError(f"table_name cannot be longer than 63 characters")
+    
+# ─────────────────────────────────────────────
+# incremental load support (for future enhancement, not implemented in current version)
+# ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
+# GET LAST INCREMENTAL VALUE
+# ─────────────────────────────────────────────
+
+def get_last_incremental_value(cursor, table_name: str, incremental_column: str):
+    """
+    Fetch the MAX value of the incremental_column from the target table.
+    This will be used as the last sync point for incremental loading.
+    """
+    try:
+        query = sql.SQL(
+            "SELECT MAX({col}) FROM {table}"
+        ).format(
+            col   = sql.Identifier(incremental_column),
+            table = sql.Identifier(table_name)
+        )
+        cursor.execute(query)
+        result = cursor.fetchone()[0]
+        print(f"Last incremental value — {incremental_column}: {result}")
+        return result
+    except Exception as e:
+        print(f"Could not fetch last value: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
+# FILTER DATAFRAME — INCREMENTAL
+# ─────────────────────────────────────────────
+
+def filter_incremental(df, incremental_column: str, last_value):
+    """
+    Only contain new rows in the DataFrame — 
+    where incremental_column > last_value
+    """
+    if last_value is None:
+        print("No last value found — full load will be performed")
+        return df
+
+    if isinstance(df, pl.DataFrame):
+        original_count = df.shape[0]
+        df = df.filter(pl.col(incremental_column) > last_value)
+        print(f"Incremental filter — {original_count} → {df.shape[0]} rows (new only)")
+
+    elif isinstance(df, pd.DataFrame):
+        original_count = df.shape[0]
+        df = df[df[incremental_column] > last_value]
+        print(f"Incremental filter — {original_count} → {df.shape[0]} rows (new only)")
+
+    return df
 
 # ─────────────────────────────────────────────
 # MAIN LOAD FUNCTION
 # ─────────────────────────────────────────────
+def load_to_db(df, option=None, table_name=None,
+               pipeline_id=None, connector_type=None, file_name=None,
+               sync_mode="full", incremental_column=None):   # ← new params
 
-def load_to_db(df, option=None, table_name=None):
-    conn = psycopg2.connect(
-        database="postgres",
-        user="postgres",
-        password="spark@1234",
-        host="localhost",
-        port="5432"
-    )
+    validate_table_name(table_name)
+
+    conn   = psycopg2.connect(**DB_CONFIG)
     cursor = conn.cursor()
 
-    # ✅ Clean column names
     if isinstance(df, pl.DataFrame):
         df = df.rename({col: clean_column(col) for col in df.columns})
     else:
         df.columns = [clean_column(c) for c in df.columns]
 
-    print(f"📋 Columns: {list(df.columns)}")
+    print(f"Columns: {list(df.columns)}")
+    print(f"Sync mode: {sync_mode}")
 
-    # ──────────────────────────────────────────
-    # OPTION 1 → APPEND
-    # add to existing table if exists, else create new
-    # ──────────────────────────────────────────
-    if option == "1":
-        if not table_name:
-            raise ValueError("table_name is required for option=1 ❌")
+    evolved_cols = []
+    match_pct    = 100.0
+    start_time   = time.time()
 
-        if not table_exists(cursor, table_name):
-            print(f"⚠️ Table '{table_name}' not found — creating automatically...")
+    try:
+        conn.autocommit = False
+
+        # ── INCREMENTAL FILTER ───────────────────────────
+        if sync_mode == "incremental" and incremental_column:
+
+            # column exist karta hai df mein?
+            if incremental_column not in df.columns:
+                raise ValueError(
+                    f"incremental_column '{incremental_column}' "
+                    f"not found in data. Available: {list(df.columns)}"
+                )
+
+            if table_exists(cursor, table_name):
+                last_value = get_last_incremental_value(
+                    cursor, table_name, incremental_column
+                )
+                df = filter_incremental(df, incremental_column, last_value)
+
+                if df.shape[0] == 0:
+                    print("No new rows found — skipping insert")
+                    conn.close()
+                    log_pipeline_metrics(
+                        pipeline_id    = pipeline_id or f"pipeline_{table_name}",
+                        table_name     = table_name,
+                        rows_inserted  = 0,
+                        rows_skipped   = 0,
+                        duration_sec   = time.time() - start_time,
+                        connector_type = connector_type,
+                        file_name      = file_name,
+                        option         = option,
+                        status         = "SKIPPED"
+                    )
+                    return
+            else:
+                print("Table not found for incremental load — full load will be performed")
+        # ────────────────────────────────────────────────
+
+        # ── OPTION 1 — APPEND ────────────────────────────
+        if option == "1":
+            if not table_exists(cursor, table_name):
+                create_table(cursor, df, table_name)
+            else:
+                report    = check_schema_mismatch(cursor, df, table_name)
+                match_pct = report["match_pct"]
+                if report["match_pct"] == 0:
+                    raise ValueError("0% column match — verify karo.")
+                evolved_cols = evolve_schema(cursor, df, table_name)
+            insert_data(cursor, df, table_name)
+
+        # ── OPTION 2 — OVERWRITE ─────────────────────────
+        elif option == "2":
+            if sync_mode == "incremental":
+                raise ValueError(
+                    "option=2 (overwrite) not with incremental. "
+                    "option=1 use karo."
+                )
+            if table_exists(cursor, table_name):
+                cursor.execute(
+                    sql.SQL("DROP TABLE {t}").format(t=sql.Identifier(table_name))
+                )
             create_table(cursor, df, table_name)
+            insert_data(cursor, df, table_name)
+
+        # ── OPTION 3 — CREATE ONLY ───────────────────────
+        elif option == "3":
+            if table_exists(cursor, table_name):
+                raise ValueError(f"Table '{table_name}' already exists.")
+            create_table(cursor, df, table_name)
+            insert_data(cursor, df, table_name)
+
         else:
-            print(f"📥 Appending into existing table: '{table_name}'")
+            raise ValueError(f"Invalid option '{option}'")
 
-        insert_data(cursor, df, table_name)
+        conn.commit()
+        duration = time.time() - start_time
+        print(f"Committed — {df.shape[0]} rows | {duration:.2f}s")
 
-    # ──────────────────────────────────────────
-    # OPTION 2 → OVERWRITE
-    # if table exist then drop + recreate, else create new
-    # otherwise fresh create
-    # ──────────────────────────────────────────
-    elif option == "2":
-        if not table_name:
-            raise ValueError("table_name is required for option=2 ❌")
+        log_pipeline_metrics(
+            pipeline_id    = pipeline_id or f"pipeline_{table_name}",
+            table_name     = table_name,
+            rows_inserted  = df.shape[0],
+            duration_sec   = duration,
+            evolved_columns= evolved_cols,
+            match_pct      = match_pct,
+            file_name      = file_name,
+            connector_type = connector_type,
+            option         = option,
+            status         = "SUCCESS"
+        )
+        print("\nPipeline completed successfully!")
 
-        if table_exists(cursor, table_name):
-            print(f"⚠️ Table '{table_name}' exists — dropping and recreating...")
-            cursor.execute(f'DROP TABLE "{table_name}"')
+    except Exception as e:
+        conn.rollback()
+        duration = time.time() - start_time
+        print(f"ROLLBACK: {e}")
+        log_pipeline_metrics(
+            pipeline_id    = pipeline_id or f"pipeline_{table_name}",
+            table_name     = table_name,
+            rows_inserted  = 0,
+            duration_sec   = duration,
+            connector_type = connector_type,
+            file_name      = file_name,
+            option         = option,
+            status         = "FAILED",
+            error_message  = str(e)
+        )
+        raise
 
-        print(f"🆕 Creating table: '{table_name}'")
-        create_table(cursor, df, table_name)
-        insert_data(cursor, df, table_name)
-
-    # ──────────────────────────────────────────
-    # OPTION 3 → CREATE ONLY (strict)
-    # Table already exist provide error, otherwise create new
-    # ──────────────────────────────────────────
-    elif option == "3":
-        if not table_name:
-            raise ValueError("table_name is required for option=3 ❌")
-
-        if table_exists(cursor, table_name):
-            raise ValueError(f"Table '{table_name}' already exists ❌ Use option=2 to overwrite")
-
-        print(f"🆕 Creating new table: '{table_name}'")
-        create_table(cursor, df, table_name)
-        insert_data(cursor, df, table_name)
-
-    else:
+    finally:
         cursor.close()
         conn.close()
-        raise ValueError(f"Invalid option: '{option}' ❌ Use 1 (append), 2 (overwrite), 3 (create new)")
 
-    conn.commit()
-    cursor.close()
-    conn.close()
+# def load_to_db(df, option=None, table_name=None,
+#                pipeline_id=None, connector_type=None, file_name=None):
 
-    print("\n✅ Pipeline completed successfully!")
+#     validate_table_name(table_name)  # First validate table name before doing any DB operation
+
+#     conn   = psycopg2.connect(**DB_CONFIG)
+#     cursor = conn.cursor()
+
+#     if isinstance(df, pl.DataFrame):
+#         df = df.rename({col: clean_column(col) for col in df.columns})
+#     else:
+#         df.columns = [clean_column(c) for c in df.columns]
+
+#     print(f"Columns: {list(df.columns)}")
+
+#     evolved_cols = []
+#     match_pct    = 100.0
+#     start_time   = time.time()
+
+#     try:
+#         conn.autocommit = False   # ✅ Off the explicit autocommit to manage transactions manually for better integrity and error handling.
+
+
+#         # ────────────────────────────
+#         # OPTION 1 — APPEND
+#         # ────────────────────────────
+#         if option == "1":
+#             if not table_name:
+#                 raise ValueError("table_name required for option=1")
+
+#             if not table_exists(cursor, table_name):
+#                 print(f"Table '{table_name}' not found — creating...")
+#                 create_table(cursor, df, table_name)
+#             else:
+#                 print(f"Appending into '{table_name}'")
+#                 report       = check_schema_mismatch(cursor, df, table_name)
+#                 match_pct    = report["match_pct"]
+
+#                 if report["match_pct"] == 0:
+#                     raise ValueError("0% column match — data load likely incorrect. Please verify the file and mapping.")
+
+#                 evolved_cols = evolve_schema(cursor, df, table_name)
+
+#             insert_data(cursor, df, table_name)
+
+#         # ────────────────────────────
+#         # OPTION 2 — OVERWRITE
+#         # ────────────────────────────
+#         elif option == "2":
+#             if not table_name:
+#                 raise ValueError("table_name required for option=2")
+
+#             if table_exists(cursor, table_name):
+#                 print(f"Table '{table_name}' exists — dropping....")
+#                 cursor.execute(
+#                     sql.SQL("DROP TABLE {t}").format(
+#                         t=sql.Identifier(table_name)
+#                     )
+#                 )
+
+#             print(f"Creating table '{table_name}'...")
+#             create_table(cursor, df, table_name)
+#             insert_data(cursor, df, table_name)
+
+#         # ────────────────────────────
+#         # OPTION 3 — CREATE ONLY
+#         # ────────────────────────────
+#         elif option == "3":
+#             if not table_name:
+#                 raise ValueError("table_name required for option=3")
+
+#             if table_exists(cursor, table_name):
+#                 raise ValueError(
+#                     f"Table '{table_name}' already exists — use option=2 to overwrite"
+#                 )
+
+#             print(f"Creating new table '{table_name}'...")
+#             create_table(cursor, df, table_name)
+#             insert_data(cursor, df, table_name)
+
+#         else:
+#             raise ValueError(f"Invalid option '{option}' — 1, 2, or 3 required ")
+
+#         # ✅ everything went well, commit the transaction 
+#         conn.commit()
+#         duration = time.time() - start_time
+#         print(f"Committed — {df.shape[0]} rows | {duration:.2f}s")
+
+#         log_pipeline_metrics(
+#             pipeline_id    = pipeline_id or f"pipeline_{table_name}",
+#             table_name     = table_name,
+#             rows_inserted  = df.shape[0],
+#             duration_sec   = duration,
+#             evolved_columns= evolved_cols,
+#             match_pct      = match_pct,
+#             file_name      = file_name,
+#             connector_type = connector_type,
+#             option         = option,
+#             status         = "SUCCESS"
+#         )
+
+#         print("\nPipeline completed successfully!")
+
+#     except Exception as e:
+#         # ✅ if anything failed — do a full rollback to maintain data integrity
+#         conn.rollback()
+#         duration = time.time() - start_time
+
+#         print(f"ROLLBACK — No changes made: {e}")
+
+#         log_pipeline_metrics(
+#             pipeline_id    = pipeline_id or f"pipeline_{table_name}",
+#             table_name     = table_name,
+#             rows_inserted  = 0,
+#             duration_sec   = duration,
+#             connector_type = connector_type,
+#             file_name      = file_name,
+#             option         = option,
+#             status         = "FAILED",
+#             error_message  = str(e)
+#         )
+
+#         raise   # Airflow will also see the exception and mark the task as failed, but we have already logged the failure in our metrics table with details for observability and debugging.
+
+#     finally:
+#         cursor.close()
+#         conn.close()
+

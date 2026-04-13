@@ -1,17 +1,31 @@
 import requests
 import polars as pl
+import time
 
-def api_connector(url):
+def api_connector(url, retries=3, delay=5):
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, timeout=30)
+            if response.status_code == 200:
+                return pl.DataFrame(response.json())
+        except Exception as e:
+            print(f"Attempt {attempt+1} failed: {e}")
+            if attempt < retries - 1:
+                time.sleep(delay)
+    raise Exception(f"API failed after {retries} attempts")
 
-    print("Fetching API data...")
 
-    response = requests.get(url)
+# def api_connector(url):
 
-    if response.status_code != 200:
-        raise Exception("API request failed")
+#     print("Fetching API data...")
 
-    data = response.json()
+#     response = requests.get(url)
 
-    df = pl.DataFrame(data)
+#     if response.status_code != 200:
+#         raise Exception("API request failed")
 
-    return df
+#     data = response.json()
+
+#     df = pl.DataFrame(data)
+
+#     return df
