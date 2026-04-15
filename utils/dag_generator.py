@@ -181,7 +181,7 @@ def _render_template(cfg: dict) -> str:
         f'TABLE_NAME      = "{table_name}"',
         f'SCHEDULE        = "{schedule}"',
         "",
-        'BASE_URL              = "http://host.docker.internal:8000"',
+        'BASE_URL              = "http://app:8000"',
         f'CONTAINER_PATH        = "{CONTAINER_DATA_PATH}"',
         f'WINDOWS_PATH          = "{WINDOWS_DATA_PATH}"',
         f'DATASET_BASE_WIN      = "{WINDOWS_DATASET_PATH}"',

@@ -18,13 +18,6 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", "airflow"),
     "port":     os.getenv("DB_PORT",     "5432"),
 }
-# DB_CONFIG = {
-#     "host":     os.getenv("DB_HOST",     "localhost"),
-#     "database": os.getenv("DB_NAME",     "postgres"),
-#     "user":     os.getenv("DB_USER",     "postgres"),
-#     "password": os.getenv("DB_PASSWORD", ""),
-#     "port":     os.getenv("DB_PORT",     "5432"),
-# }
 
 # ─────────────────────────────────────────────
 # CLEAN COLUMN NAMES
@@ -123,7 +116,7 @@ def create_table(cursor, df, table_name):
     col_definitions = []
     for col, dtype in schema.items():
         sql_type   = dtype_to_sql(dtype)
-        # sql.Identifier se column aur table safely quote hote hain
+        # with sql.SQL and sql.Identifier, column names and table names are safely quoted to prevent SQL injection and handle special characters. For example, a column named "user name" will be quoted as "user name" in the SQL query, ensuring it is treated as a single identifier.
         col_definitions.append(
             sql.SQL("{} {}").format(
                 sql.Identifier(col),
@@ -181,10 +174,6 @@ def check_schema_mismatch(cursor, df, table_name):
         "extra_in_file":   sorted(extra_in_file),
         "match_pct":       match_pct
     }
-
-
-
-
 
 # ─────────────────────────────────────────────
 # INSERT DATA
@@ -525,132 +514,3 @@ def load_to_db(df, option=None, table_name=None,
     finally:
         cursor.close()
         conn.close()
-
-# def load_to_db(df, option=None, table_name=None,
-#                pipeline_id=None, connector_type=None, file_name=None):
-
-#     validate_table_name(table_name)  # First validate table name before doing any DB operation
-
-#     conn   = psycopg2.connect(**DB_CONFIG)
-#     cursor = conn.cursor()
-
-#     if isinstance(df, pl.DataFrame):
-#         df = df.rename({col: clean_column(col) for col in df.columns})
-#     else:
-#         df.columns = [clean_column(c) for c in df.columns]
-
-#     print(f"Columns: {list(df.columns)}")
-
-#     evolved_cols = []
-#     match_pct    = 100.0
-#     start_time   = time.time()
-
-#     try:
-#         conn.autocommit = False   # ✅ Off the explicit autocommit to manage transactions manually for better integrity and error handling.
-
-
-#         # ────────────────────────────
-#         # OPTION 1 — APPEND
-#         # ────────────────────────────
-#         if option == "1":
-#             if not table_name:
-#                 raise ValueError("table_name required for option=1")
-
-#             if not table_exists(cursor, table_name):
-#                 print(f"Table '{table_name}' not found — creating...")
-#                 create_table(cursor, df, table_name)
-#             else:
-#                 print(f"Appending into '{table_name}'")
-#                 report       = check_schema_mismatch(cursor, df, table_name)
-#                 match_pct    = report["match_pct"]
-
-#                 if report["match_pct"] == 0:
-#                     raise ValueError("0% column match — data load likely incorrect. Please verify the file and mapping.")
-
-#                 evolved_cols = evolve_schema(cursor, df, table_name)
-
-#             insert_data(cursor, df, table_name)
-
-#         # ────────────────────────────
-#         # OPTION 2 — OVERWRITE
-#         # ────────────────────────────
-#         elif option == "2":
-#             if not table_name:
-#                 raise ValueError("table_name required for option=2")
-
-#             if table_exists(cursor, table_name):
-#                 print(f"Table '{table_name}' exists — dropping....")
-#                 cursor.execute(
-#                     sql.SQL("DROP TABLE {t}").format(
-#                         t=sql.Identifier(table_name)
-#                     )
-#                 )
-
-#             print(f"Creating table '{table_name}'...")
-#             create_table(cursor, df, table_name)
-#             insert_data(cursor, df, table_name)
-
-#         # ────────────────────────────
-#         # OPTION 3 — CREATE ONLY
-#         # ────────────────────────────
-#         elif option == "3":
-#             if not table_name:
-#                 raise ValueError("table_name required for option=3")
-
-#             if table_exists(cursor, table_name):
-#                 raise ValueError(
-#                     f"Table '{table_name}' already exists — use option=2 to overwrite"
-#                 )
-
-#             print(f"Creating new table '{table_name}'...")
-#             create_table(cursor, df, table_name)
-#             insert_data(cursor, df, table_name)
-
-#         else:
-#             raise ValueError(f"Invalid option '{option}' — 1, 2, or 3 required ")
-
-#         # ✅ everything went well, commit the transaction 
-#         conn.commit()
-#         duration = time.time() - start_time
-#         print(f"Committed — {df.shape[0]} rows | {duration:.2f}s")
-
-#         log_pipeline_metrics(
-#             pipeline_id    = pipeline_id or f"pipeline_{table_name}",
-#             table_name     = table_name,
-#             rows_inserted  = df.shape[0],
-#             duration_sec   = duration,
-#             evolved_columns= evolved_cols,
-#             match_pct      = match_pct,
-#             file_name      = file_name,
-#             connector_type = connector_type,
-#             option         = option,
-#             status         = "SUCCESS"
-#         )
-
-#         print("\nPipeline completed successfully!")
-
-#     except Exception as e:
-#         # ✅ if anything failed — do a full rollback to maintain data integrity
-#         conn.rollback()
-#         duration = time.time() - start_time
-
-#         print(f"ROLLBACK — No changes made: {e}")
-
-#         log_pipeline_metrics(
-#             pipeline_id    = pipeline_id or f"pipeline_{table_name}",
-#             table_name     = table_name,
-#             rows_inserted  = 0,
-#             duration_sec   = duration,
-#             connector_type = connector_type,
-#             file_name      = file_name,
-#             option         = option,
-#             status         = "FAILED",
-#             error_message  = str(e)
-#         )
-
-#         raise   # Airflow will also see the exception and mark the task as failed, but we have already logged the failure in our metrics table with details for observability and debugging.
-
-#     finally:
-#         cursor.close()
-#         conn.close()
-

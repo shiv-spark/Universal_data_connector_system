@@ -7,13 +7,7 @@ from loaders.db_loader import load_to_db
 from dotenv import load_dotenv
 
 load_dotenv()
-# DB_CONFIG = {
-#     "host":     os.getenv("DB_HOST",     "localhost"),
-#     "database": os.getenv("DB_NAME",     "postgres"),
-#     "user":     os.getenv("DB_USER",     "postgres"),
-#     "password": os.getenv("DB_PASSWORD", ""),
-#     "port":     os.getenv("DB_PORT",     "5432"),
-# }
+
 DB_CONFIG = {
     "host":     os.getenv("DB_HOST",     "postgres"),
     "database": os.getenv("DB_NAME",     "airflow"),
@@ -40,7 +34,8 @@ def run_ingestion(connector_func, source, connector_name, *args,
         "S3Connector":           "s3",
     }
     connector_type = connector_type_map.get(connector_name, connector_name)
-    file_name      = os.path.basename(source) if source and os.path.exists(source) else source
+    # file_name      = os.path.basename(source) if source and os.path.exists(source) else source
+    file_name = os.path.basename(source) if (source and os.path.exists(source)) else (source[:50] if source else None)
     pipeline_id    = f"pipeline_{table_name}"
 
     try:
@@ -74,58 +69,3 @@ def run_ingestion(connector_func, source, connector_name, *args,
 
     finally:
         conn.close()
-# def run_ingestion(connector_func, source, connector_name, *args, option=None, table_name=None):
-
-#     conn     = psycopg2.connect(**DB_CONFIG)
-#     tracker  = RunTracker(conn)
-#     run_id   = tracker.start_run(connector_name, source)
-#     logger   = DBLogger(conn, run_id)
-
-#     # connector type mapping for metrics and logging
-#     connector_type_map = {
-#         "CSVConnector":          "csv",
-#         "ExcelConnector":        "excel",
-#         "GoogleSheetsConnector": "google_sheets",
-#         "APIConnector":          "api",
-#     }
-#     connector_type = connector_type_map.get(connector_name, connector_name)
-
-#     # derive file_name from source (if source is a file path)
-    
-#     file_name = os.path.basename(source) if source and os.path.exists(source) else source
-
-#     # create pipeline_id using table_name (if table_name available )
-#     pipeline_id = f"pipeline_{table_name}"
-
-#     try:
-#         logger.log("INFO", f"{connector_name} started")
-
-#         df        = connector_func(*args)
-#         row_count = df.shape[0]
-
-#         logger.log("INFO", f"Fetched {row_count} rows")
-
-#         detect_schema(df)
-#         logger.log("INFO", "Schema detected")
-
-#         load_to_db(
-#             df,
-#             option         = option,
-#             table_name     = table_name,
-#             pipeline_id    = pipeline_id,     
-#             connector_type = connector_type,  
-#             file_name      = file_name,       
-#         )
-
-#         logger.log("INFO", "Data loaded to DB")
-#         tracker.end_run(run_id, "SUCCESS", row_count)
-
-#         return {"status": "SUCCESS", "run_id": run_id, "rows": row_count}
-
-#     except Exception as e:
-#         logger.log("ERROR", str(e))
-#         tracker.end_run(run_id, "FAILED", 0, str(e))
-#         return {"status": "FAILED", "run_id": run_id, "error": str(e)}
-
-#     finally:
-#         conn.close()

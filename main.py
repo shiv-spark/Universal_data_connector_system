@@ -1,3 +1,4 @@
+import re
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, Query, HTTPException
 from pydantic import BaseModel
@@ -15,12 +16,16 @@ from connectors.google_sheets_connector import google_sheet_connector
 from connectors.api_connector import api_connector
 from utils.ingest_runner import run_ingestion
 import smtplib
+from typing import List
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
 import os
+from datetime import datetime
 from connectors.postgres_connector import postgres_connector
 from connectors.s3_connector import s3_connector
+
+
 def _rows_to_dicts(cursor):
     """Convert psycopg2 cursor result to list of dictionaries"""
     columns = [desc[0] for desc in cursor.description]
@@ -113,16 +118,6 @@ DB_CONFIG = {
 }
 
 
-# DB_CONFIG = {
-#     "host":     os.getenv("DB_HOST",     "localhost"),
-#     "database": os.getenv("DB_NAME",     "airflow"),
-#     "user":     os.getenv("DB_USER",     "airflow"),
-#     "password": os.getenv("DB_PASSWORD", "airflow"),
-#     "port":     os.getenv("DB_PORT",     "5432")
-# }
-
-
-
 def get_conn():
     return psycopg2.connect(**DB_CONFIG)
 
@@ -185,9 +180,6 @@ class ExcelRequest(BaseModel):
 @app.post("/ingest_excel")
 def ingest_excel(req: ExcelRequest):
     validate_inputs(req.option, req.table_name)
-    # skip = validate_inputs(req.option, req.table_name)
-    # if skip:
-    #     return skip
     return run_ingestion(
         excel_connector,
         req.file_path,
@@ -214,9 +206,6 @@ class GoogleSheetRequest(BaseModel):
 @app.post("/ingest_google_sheet")
 def ingest_google_sheet(req: GoogleSheetRequest):
     validate_inputs(req.option, req.table_name)
-    # skip = validate_inputs(req.option, req.table_name)
-    # if skip:
-    #     return skip
     return run_ingestion(
         google_sheet_connector,
         req.sheet_url,
@@ -244,9 +233,6 @@ class APIRequest(BaseModel):
 @app.post("/ingest_api")
 def ingest_api(req: APIRequest):
     validate_inputs(req.option, req.table_name)
-    # skip = validate_inputs(req.option, req.table_name)
-    # if skip:
-    #     return skip
     return run_ingestion(
         api_connector,
         req.url,
@@ -326,22 +312,6 @@ def ingest_s3(req: S3Request):
     )
 
 
-
-
-
-# ─────────────────────────────────────────────
-# PIPELINE RUNS & LOGS
-# ─────────────────────────────────────────────
-
-# @app.get("/runs")
-# def get_runs():
-#     conn = get_conn()
-#     cursor = conn.cursor()
-#     cursor.execute("SELECT * FROM pipeline_runs ORDER BY start_time DESC")
-#     data = cursor.fetchall()
-#     conn.close()
-#     return data
-
 @app.get("/runs")
 def get_runs():
     conn = get_conn()
@@ -351,9 +321,6 @@ def get_runs():
     conn.close()
     return result
 
-@app.get("/test_dict")
-def test_dict():
-    return [{"id": 1, "name": "test"}]
 
 @app.get("/logs/{run_id}")
 def get_logs(run_id: int):
@@ -554,12 +521,58 @@ def create_pipeline(req: CreatePipelineRequest):
     })
  
     return result
+# ────────────────────────────────────────────
+# Multiple sources pipeline creation 
+# ───────────────────────────────────────────
+
+
+class SourceConfig(BaseModel):
+    connector_type: str          # csv, excel, google_sheets, api, postgres, s3
+    file_path:      Optional[str] = None
+    folder_path:    Optional[str] = None
+    sheet_url:      Optional[str] = None
+    api_url:        Optional[str] = None
+    s3_bucket:      Optional[str] = None
+    s3_key:         Optional[str] = None
+    s3_file_type:   Optional[str] = "csv"
+    src_pg_host:    Optional[str] = None
+    src_pg_db:      Optional[str] = None
+    src_pg_user:    Optional[str] = None
+    src_pg_password:Optional[str] = None
+    src_pg_port:    Optional[str] = "5432"
+    pg_query:       Optional[str] = None
+
+class MultiSourcePipelineRequest(BaseModel):
+    pipeline_name: str
+    table_name:    str
+    option:        str          = "1"   # for first source. Subsequent sources will always append (option "1") to avoid overwriting.
+    schedule:      str          = "*/5 * * * *"
+    sync_mode:     str          = "full"
+    incremental_column: Optional[str] = None
+    sources:       List[SourceConfig]  # ← multiple sources
+
+
+@app.post("/create_multi_pipeline")
+def create_multi_pipeline(req: MultiSourcePipelineRequest):
+    if not req.sources:
+        raise HTTPException(status_code=400, detail="At least one source required.")
+
+    from utils.multi_dag_generator import create_multi_dag_file
+    result = create_multi_dag_file(req.model_dump())
+
+    if result.get("status") == "FAILED":
+        raise HTTPException(status_code=400, detail=result)
+
+    return result
+
+
+
 # ── DELETE /delete_pipeline/{pipeline_name} ──────────────────────────────────
  
 @app.delete("/delete_pipeline/{pipeline_name}")
 def delete_pipeline(pipeline_name: str):
     """
-    Existing DAG file delete karo.
+    Delete an existing DAG file.
     Example: DELETE /delete_pipeline/hr_data_csv
     """
     result = delete_dag_file(pipeline_name)
@@ -581,90 +594,110 @@ def list_pipelines():
         "status":    "SUCCESS",
         "pipelines": list_dag_files()
     }
-
-# @app.get("/table/{table_name}")
-# def get_table_data(table_name: str):
-#     conn = get_conn()
-#     cursor = conn.cursor()
-
-#     try:
-#         # Table exist check
-#         cursor.execute("""
-#             SELECT EXISTS (
-#                 SELECT FROM information_schema.tables
-#                 WHERE table_name = %s
-#             )
-#         """, (table_name,))
-#         exists = cursor.fetchone()[0]
-
-#         if not exists:
-#             raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found.")
-
-#         # Row count
-#         cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"')
-#         count = cursor.fetchone()[0]
-
-#         # Poora data
-#         cursor.execute(f'SELECT * FROM "{table_name}"')
-#         rows  = cursor.fetchall()
-#         cols  = [desc[0] for desc in cursor.description]
-#         data  = [dict(zip(cols, row)) for row in rows]
-
-#         return {
-#             "table":      table_name,
-#             "row_count":  count,
-#             "columns":    cols,
-#             "data":       data
-#         }
-
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-#     finally:
-#         conn.close()
-
 @app.get("/table/{table_name}")
-def get_table_data(table_name: str):
-    conn = get_conn()
+def get_table_data(
+    table_name: str,
+    limit:  int            = Query(50,   ge=1, le=1000),
+    offset: int            = Query(0,    ge=0),
+    sort_by: Optional[str] = Query(None),
+    order:   str           = Query("asc", regex="^(asc|desc)$"),
+    filter_col: Optional[str] = Query(None),
+    filter_val: Optional[str] = Query(None),
+):
+    conn   = get_conn()
     cursor = conn.cursor()
 
     try:
-        # Step 1 — validate table name format before touching the DB
+        # ── 1. Validate table name ─────────────────────────────────────
         if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table_name):
             raise HTTPException(status_code=400, detail=f"Invalid table name '{table_name}'.")
 
-        # Step 2 — parameterised existence check
         cursor.execute("""
             SELECT EXISTS (
                 SELECT FROM information_schema.tables
-                WHERE table_schema = 'public'
-                AND table_name = %s
+                WHERE table_schema = 'public' AND table_name = %s
             )
         """, (table_name,))
-        exists = cursor.fetchone()[0]
-
-        if not exists:
+        if not cursor.fetchone()[0]:
             raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found.")
 
-        # Step 3 — use sql.Identifier for the table name in dynamic queries
-        cursor.execute(
-            sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(table_name))
-        )
-        count = cursor.fetchone()[0]
+        # ── 2. Validate sort_by column (must exist in table) ───────────
+        cursor.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s
+        """, (table_name,))
+        valid_columns = {row[0] for row in cursor.fetchall()}
 
-        cursor.execute(
-            sql.SQL("SELECT * FROM {}").format(sql.Identifier(table_name))
+        if sort_by and sort_by not in valid_columns:
+            raise HTTPException(status_code=400, detail=f"sort_by column '{sort_by}' not found in table.")
+
+        if filter_col and filter_col not in valid_columns:
+            raise HTTPException(status_code=400, detail=f"filter_col '{filter_col}' not found in table.")
+
+        # ── 3. Build base query with optional filter ───────────────────
+        #    filter_val is passed as a parameter — never interpolated
+        where_clause = sql.SQL("")
+        count_params = []
+        data_params  = []
+
+        if filter_col and filter_val is not None:
+            where_clause = sql.SQL("WHERE CAST({col} AS TEXT) ILIKE %s").format(
+                col=sql.Identifier(filter_col)
+            )
+            like_val     = f"%{filter_val}%"
+            count_params = [like_val]
+            data_params  = [like_val]
+
+        # ── 4. Total count (for pagination metadata) ───────────────────
+        count_query = sql.SQL("SELECT COUNT(*) FROM {table} {where}").format(
+            table=sql.Identifier(table_name),
+            where=where_clause,
         )
+        cursor.execute(count_query, count_params)
+        total = cursor.fetchone()[0]
+
+        # ── 5. Main data query with sort + limit + offset ──────────────
+        order_clause = sql.SQL("ORDER BY {col} {dir}").format(
+            col=sql.Identifier(sort_by) if sort_by else sql.Identifier(list(valid_columns)[0]),
+            dir=sql.SQL("DESC" if order == "desc" else "ASC"),
+        ) if sort_by else sql.SQL("")
+
+        data_query = sql.SQL(
+            "SELECT * FROM {table} {where} {order} LIMIT %s OFFSET %s"
+        ).format(
+            table=sql.Identifier(table_name),
+            where=where_clause,
+            order=order_clause,
+        )
+        data_params.extend([limit, offset])
+        cursor.execute(data_query, data_params)
+
         rows = cursor.fetchall()
         cols = [desc[0] for desc in cursor.description]
         data = [dict(zip(cols, row)) for row in rows]
 
+        # ── 6. Response with pagination metadata ───────────────────────
         return {
-            "table":     table_name,
-            "row_count": count,
-            "columns":   cols,
-            "data":      data
+            "table":      table_name,
+            "columns":    sorted(valid_columns),
+            "pagination": {
+                "total":    total,
+                "limit":    limit,
+                "offset":   offset,
+                "has_more": (offset + limit) < total,
+                "page":     (offset // limit) + 1,
+                "pages":    -(-total // limit),   # ceiling division
+            },
+            "filter": {
+                "col": filter_col,
+                "val": filter_val,
+            },
+            "sort": {
+                "col":   sort_by,
+                "order": order,
+            },
+            "row_count": len(data),
+            "data":      data,
         }
 
     except HTTPException:
@@ -1049,7 +1082,7 @@ def get_pipeline_logs_by_run(pipeline_name: str, dag_run_id: str):
 
 @app.get("/metrics/{pipeline_id}")
 def get_pipeline_metrics(pipeline_id: str, limit: int = 20):
-    """Ek pipeline ki last N runs ki metrics."""
+    """Latest N runs metrics for a pipeline."""
     conn = get_conn()
     cur  = conn.cursor()
 
@@ -1082,7 +1115,7 @@ def get_pipeline_metrics(pipeline_id: str, limit: int = 20):
 # aggregated metrics summary for all pipelines
 @app.get("/metrics/summary/all")
 def get_all_metrics_summary():
-    """Saari pipelines ka aggregated summary."""
+    """All pipelines aggregated summary."""
     conn = get_conn()
     cur  = conn.cursor()
 
@@ -1109,17 +1142,15 @@ def get_all_metrics_summary():
     return {"summary": [dict(zip(cols, r)) for r in rows]}
 
 
-# ─────────────────────────────────────────────
-# Dashboard summary
-# ─────────────────────────────────────────────
+
+
 @app.get("/dashboard/summary")
 def dashboard_summary():
-    """Dashboard ke liye saara data ek jagah"""
     conn = get_conn()
     cur  = conn.cursor()
 
     try:
-        # ── Metric cards ─────────────────────────────
+        # ── 1. Metric cards (last 24h) ────────────────────────────
         cur.execute("""
             SELECT
                 COUNT(*)                                              AS total_runs,
@@ -1127,19 +1158,40 @@ def dashboard_summary():
                 COUNT(*) FILTER (WHERE status = 'FAILED')            AS failed,
                 COUNT(*) FILTER (WHERE status = 'SKIPPED')           AS skipped,
                 COALESCE(SUM(rows_inserted), 0)                      AS total_rows,
-                ROUND(AVG(duration_sec)::numeric, 2)                 AS avg_duration
+                ROUND(AVG(duration_sec)::numeric, 2)                 AS avg_duration,
+                ROUND(
+                    COUNT(*) FILTER (WHERE status = 'SUCCESS') * 100.0
+                    / NULLIF(COUNT(*), 0), 1
+                )                                                     AS success_rate_pct
             FROM pipeline_metrics
             WHERE logged_at >= NOW() - INTERVAL '24 hours'
         """)
         metrics = dict(zip([d[0] for d in cur.description], cur.fetchone()))
 
-        # ── Last 7 days runs ─────────────────────────
+        # ── 2. System health ──────────────────────────────────────
+        cur.execute("""
+            SELECT
+                CASE
+                    WHEN COUNT(*) FILTER (WHERE status = 'FAILED'
+                         AND logged_at >= NOW() - INTERVAL '1 hour') > 0
+                    THEN 'DEGRADED'
+                    WHEN COUNT(*) FILTER (WHERE status = 'FAILED'
+                         AND logged_at >= NOW() - INTERVAL '24 hours') > 3
+                    THEN 'WARNING'
+                    ELSE 'HEALTHY'
+                END AS system_health
+            FROM pipeline_metrics
+        """)
+        health = cur.fetchone()[0]
+
+        # ── 3. Last 7 days daily breakdown ────────────────────────
         cur.execute("""
             SELECT
                 DATE(logged_at)                                       AS day,
                 COUNT(*) FILTER (WHERE status = 'SUCCESS')           AS success,
                 COUNT(*) FILTER (WHERE status = 'FAILED')            AS failed,
-                COUNT(*) FILTER (WHERE status = 'SKIPPED')           AS skipped
+                COUNT(*) FILTER (WHERE status = 'SKIPPED')           AS skipped,
+                COALESCE(SUM(rows_inserted), 0)                      AS rows
             FROM pipeline_metrics
             WHERE logged_at >= NOW() - INTERVAL '7 days'
             GROUP BY DATE(logged_at)
@@ -1149,13 +1201,34 @@ def dashboard_summary():
         cols = [d[0] for d in cur.description]
         daily = [dict(zip(cols, r)) for r in rows]
 
-        # ── Connector breakdown ───────────────────────
+        # ── 4. Hourly trend (last 24h) ────────────────────────────
+        cur.execute("""
+            SELECT
+                DATE_TRUNC('hour', logged_at)                        AS hour,
+                COUNT(*)                                             AS total,
+                COUNT(*) FILTER (WHERE status = 'SUCCESS')           AS success,
+                COUNT(*) FILTER (WHERE status = 'FAILED')            AS failed,
+                COALESCE(SUM(rows_inserted), 0)                      AS rows
+            FROM pipeline_metrics
+            WHERE logged_at >= NOW() - INTERVAL '24 hours'
+            GROUP BY DATE_TRUNC('hour', logged_at)
+            ORDER BY hour
+        """)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        hourly = [dict(zip(cols, r)) for r in rows]
+
+        # ── 5. Connector breakdown ────────────────────────────────
         cur.execute("""
             SELECT
                 connector_type,
-                COUNT(*)                          AS runs,
-                ROUND(AVG(duration_sec)::numeric,2) AS avg_dur,
-                COALESCE(SUM(rows_inserted),0)    AS total_rows
+                COUNT(*)                                             AS runs,
+                ROUND(AVG(duration_sec)::numeric, 2)                AS avg_dur,
+                COALESCE(SUM(rows_inserted), 0)                     AS total_rows,
+                ROUND(
+                    COUNT(*) FILTER (WHERE status = 'SUCCESS') * 100.0
+                    / NULLIF(COUNT(*), 0), 1
+                )                                                    AS success_rate
             FROM pipeline_metrics
             GROUP BY connector_type
             ORDER BY runs DESC
@@ -1164,7 +1237,64 @@ def dashboard_summary():
         cols = [d[0] for d in cur.description]
         connectors = [dict(zip(cols, r)) for r in rows]
 
-        # ── Recent runs ───────────────────────────────
+        # ── 6. Per pipeline health ────────────────────────────────
+        cur.execute("""
+            SELECT
+                pipeline_id,
+                connector_type,
+                COUNT(*)                                             AS total_runs,
+                COUNT(*) FILTER (WHERE status = 'SUCCESS')          AS success,
+                COUNT(*) FILTER (WHERE status = 'FAILED')           AS failed,
+                ROUND(
+                    COUNT(*) FILTER (WHERE status = 'SUCCESS') * 100.0
+                    / NULLIF(COUNT(*), 0), 1
+                )                                                    AS success_rate,
+                ROUND(AVG(duration_sec)::numeric, 2)                AS avg_duration,
+                (ARRAY_AGG(status ORDER BY logged_at DESC))[1]      AS last_status,
+                MAX(logged_at)                                       AS last_run_at
+            FROM pipeline_metrics
+            GROUP BY pipeline_id, connector_type
+            ORDER BY last_run_at DESC
+        """)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        pipeline_health = [dict(zip(cols, r)) for r in rows]
+
+        # ── 7. Top failing pipelines ──────────────────────────────
+        cur.execute("""
+            SELECT
+                pipeline_id,
+                COUNT(*)                                             AS fail_count,
+                MAX(error_message)                                   AS last_error,
+                MAX(logged_at)                                       AS last_failed_at
+            FROM pipeline_metrics
+            WHERE status = 'FAILED'
+              AND logged_at >= NOW() - INTERVAL '7 days'
+            GROUP BY pipeline_id
+            ORDER BY fail_count DESC
+            LIMIT 5
+        """)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        top_failing = [dict(zip(cols, r)) for r in rows]
+
+        # ── 8. Data volume trend (last 30 days) ───────────────────
+        cur.execute("""
+            SELECT
+                DATE(logged_at)                                      AS day,
+                COALESCE(SUM(rows_inserted), 0)                     AS total_rows,
+                COUNT(*)                                             AS runs
+            FROM pipeline_metrics
+            WHERE logged_at >= NOW() - INTERVAL '30 days'
+              AND status = 'SUCCESS'
+            GROUP BY DATE(logged_at)
+            ORDER BY day
+        """)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        volume_trend = [dict(zip(cols, r)) for r in rows]
+
+        # ── 9. Recent runs ────────────────────────────────────────
         cur.execute("""
             SELECT
                 pipeline_id,
@@ -1172,6 +1302,7 @@ def dashboard_summary():
                 status,
                 rows_inserted,
                 duration_sec,
+                error_message,
                 logged_at
             FROM pipeline_metrics
             ORDER BY logged_at DESC
@@ -1181,27 +1312,16 @@ def dashboard_summary():
         cols = [d[0] for d in cur.description]
         recent = [dict(zip(cols, r)) for r in rows]
 
-        # ── Per pipeline rows ─────────────────────────
-        cur.execute("""
-            SELECT
-                pipeline_id,
-                SUM(rows_inserted) AS total_rows
-            FROM pipeline_metrics
-            WHERE status = 'SUCCESS'
-            GROUP BY pipeline_id
-            ORDER BY total_rows DESC
-            LIMIT 10
-        """)
-        rows = cur.fetchall()
-        cols = [d[0] for d in cur.description]
-        pipeline_rows = [dict(zip(cols, r)) for r in rows]
-
         return {
-            "metrics":       metrics,
-            "daily":         daily,
-            "connectors":    connectors,
-            "recent_runs":   recent,
-            "pipeline_rows": pipeline_rows,
+            "system_health":   health,           # HEALTHY / WARNING / DEGRADED
+            "metrics":         metrics,           # 24h summary + success_rate_pct
+            "daily":           daily,             # last 7 days
+            "hourly":          hourly,            # last 24h hour by hour
+            "connectors":      connectors,        # per connector breakdown
+            "pipeline_health": pipeline_health,   # per pipeline success rate
+            "top_failing":     top_failing,       # worst 5 pipelines
+            "volume_trend":    volume_trend,      # 30 day row volume
+            "recent_runs":     recent,            # last 20 runs
         }
 
     finally:
@@ -1209,6 +1329,19 @@ def dashboard_summary():
         conn.close()
 
 
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=False) 
+@app.get("/health")
+def health_check():
+    try:
+        conn = get_conn()
+        conn.close()
+        db_status = "ok"
+    except:
+        db_status = "unreachable"
+
+    return {
+        "status":    "ok" if db_status == "ok" else "degraded",
+        "database":  db_status,
+        "timestamp": datetime.now().isoformat(),
+        "version":   "1.7"
+    }
+

@@ -1,11 +1,8 @@
-
-
 import pandas as pd
 import polars as pl
 import requests
 from io import StringIO
 import re
-
 
 def convert_to_export_url(sheet_url: str, gid: str = "0") -> str:
     match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_url)
@@ -130,75 +127,3 @@ def google_sheet_connector(sheet_url: str, engine: str = "pandas"):
     print(f"📋 Columns: {list(df.columns)}")
     return df
 
-
-# def google_sheet_connector(sheet_url: str, engine: str = "pandas"):
-#     """
-#     Read a public Google Sheet into a cleaned DataFrame.
-
-#     Args:
-#         sheet_url : Full Google Sheets URL
-#         engine    : 'pandas' or 'polars'
-
-#     Returns:
-#         Cleaned DataFrame ready for DB insertion
-#     """
-#     export_url = convert_to_export_url(sheet_url)
-#     response = requests.get(export_url)
-
-#     content_type = response.headers.get("Content-Type", "")
-
-#     if response.status_code != 200:
-#         raise ConnectionError(f"Failed to fetch sheet. Status: {response.status_code}")
-
-#     if "text/html" in content_type:
-#         raise PermissionError(
-#             "Google returned HTML instead of CSV.\n"
-#             "Make sheet public: Share → Anyone with the link → Viewer"
-#         )
-
-#     if engine == "pandas":
-#         df = pd.read_csv(
-#             StringIO(response.text),
-#             skip_blank_lines=True,   # skip empty rows
-#             header=0,              # treat first row as header
-#         )
-#         # Drop fully empty columns
-#         df = df.dropna(axis=1, how="all")
-#         # Drop fully empty rows
-#         df = df.dropna(axis=0, how="all")
-#         # Clean column names
-#         df = clean_columns(df, engine="pandas")
-
-#     elif engine == "polars":
-#         df = pl.read_csv(
-#             StringIO(response.text),
-#             infer_schema_length=10000,
-#             ignore_errors=True,
-#             skp_blank_lines=True,   # skip empty rows
-#             header=0,
-#         )
-#         # Drop fully null columns
-#         df = df[[col for col in df.columns if df[col].null_count() < len(df)]]
-#         # Clean column names
-#         df = clean_columns(df, engine="polars")
-
-#     else:
-#         raise ValueError(f"Unsupported engine '{engine}'. Use 'pandas' or 'polars'.")
-
-#     print(f"✅ Loaded {df.shape[0]} rows × {df.shape[1]} columns")
-#     print(f"📋 Columns: {list(df.columns)}")
-#     return df
-
-
-
-
-
-
-# # ─────────────────────────────────────────────
-# # Usage
-# # ─────────────────────────────────────────────
-# sheet_url = "https://docs.google.com/spreadsheets/d/1syOiD7p1UMN63WRNn0vt4HEJIbxvavvQHZLFcF3KZrY/edit?usp=sharing"
-
-# df = google_sheet_connector(sheet_url, engine="pandas")
-# print(df.head())
-# >>>>>>> origin/main

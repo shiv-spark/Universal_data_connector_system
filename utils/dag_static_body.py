@@ -1,5 +1,9 @@
 import hashlib
+import json
+import shutil
 import os
+import psycopg2
+from datetime import datetime
 from dotenv import load_dotenv
 import smtplib, traceback
 from email.mime.text import MIMEText
@@ -24,30 +28,34 @@ def _normalize(path):
         return path
     return path.replace("\\\\", "/").replace("\\", "/")
 
-
 def to_windows_path(path):
     n         = _normalize(path)
     n_dataset = _normalize(DATASET_BASE_CON)
     n_user    = _normalize(CONTAINER_PATH)
-    if n and n.startswith(n_dataset):
+    # ← guard: only translate back if the Windows base is actually set
+    if n_dataset and DATASET_BASE_WIN and n.startswith(n_dataset):
         return n.replace(n_dataset, DATASET_BASE_WIN).replace("/", "\\")
-    if n and n.startswith(n_user):
+    if n_user and WINDOWS_PATH and n.startswith(n_user):
         return n.replace(n_user, WINDOWS_PATH).replace("/", "\\")
-    return path
+    # no Windows path configured — return as-is (pure container mode)
+    return n
+
 
 
 def to_container_path(path):
-    # Windows path (E:/... E:\\... E:\\\\...) convert to container path
     if not path:
         return path
     n         = _normalize(path)
     n_dataset = _normalize(DATASET_BASE_WIN)
     n_windows = _normalize(WINDOWS_PATH)
-    if n.startswith(n_dataset):
+    # ← guard: only translate if the Windows base is actually set
+    if n_dataset and n.startswith(n_dataset):
         return n.replace(n_dataset, DATASET_BASE_CON)
-    if n.startswith(n_windows):
+    if n_windows and n.startswith(n_windows):
         return n.replace(n_windows, CONTAINER_PATH)
+    # path is already a container path — return normalized, no translation
     return n
+
 
 
 def _ensure_pipeline_folders():
@@ -154,13 +162,6 @@ def _save_url_record(url, dest_folder, prefix="url"):
         json.dump({"url": url, "timestamp": ts, "pipeline": PIPELINE_ID}, fh, indent=2)
     print(f"URL record saved: {dest}")
 
-
-# def _ingest_file(container_file, endpoint):
-#     windows_file = to_windows_path(container_file)
-#     payload = {"file_path": windows_file, "option": OPTION, "table_name": TABLE_NAME}
-#     res     = requests.post(f"{BASE_URL}/{endpoint}", json=payload, timeout=60)
-#     print(f"Status: {res.status_code} | Response: {res.text}")
-#     return res.status_code == 200 and res.json().get("status") == "SUCCESS"
 
 def _ingest_file(container_file, endpoint):
     windows_file = to_windows_path(container_file)
@@ -498,20 +499,6 @@ def run_connector(**context):
         _log_run_end(dag_run_id, "FAILED", str(e))
         _send_email("failed", error=str(e), dag_run_id=dag_run_id)
         raise   # re-raise so Airflow also marks the task as failed
-
-
-import psycopg2
-from datetime import datetime
-
-
-DB_CONFIG = {
-    "host":     os.getenv("DB_HOST",     "host.docker.internal"),
-    "database": os.getenv("DB_NAME",     "airflow"),
-    "user":     os.getenv("DB_USER",     "airflow"),
-    "password": os.getenv("DB_PASSWORD", "airflow"),
-    "port":     os.getenv("DB_PORT",     "5432"),
-}
-
 
 def _get_db_conn():
     return psycopg2.connect(**DB_CONFIG)

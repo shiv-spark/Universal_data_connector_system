@@ -45,7 +45,7 @@ def s3_connector(bucket: str, key: str, file_type: str = "csv"):
 
 
 def _list_s3_files(s3_client, bucket: str, prefix: str, file_type: str) -> list:
-    """S3 prefix ke andar sab matching files ki list"""
+    """List all S3 files in a given prefix with a specific file type"""
     response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
 
     if "Contents" not in response:
@@ -62,7 +62,7 @@ def _list_s3_files(s3_client, bucket: str, prefix: str, file_type: str) -> list:
 
 
 def _read_s3_file(s3_client, bucket: str, key: str, file_type: str) -> pl.DataFrame:
-    """Single S3 file read karo aur DataFrame return karo"""
+    """Read a single S3 file and return as DataFrame"""
     obj  = s3_client.get_object(Bucket=bucket, Key=key)
     data = obj["Body"].read()
     print(f"Fetched: {key} — {len(data)} bytes")
