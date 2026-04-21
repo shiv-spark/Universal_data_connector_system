@@ -143,7 +143,11 @@ def _render_template(cfg: dict) -> str:
     # ────────────────────────────────────────────────────
 
     def q(val):
-        return f'"{val}"' if val is not None else "None"
+        if val is None:
+            return "None"
+        # double quotes and backslash escape
+        safe = str(val).replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{safe}"'
 
     header_lines = [
         "from airflow import DAG",
@@ -275,3 +279,89 @@ def list_dag_files() -> list:
                 "size_kb":   round(os.path.getsize(fpath) / 1024, 1),
             })
     return result
+
+def edit_dag_file(pipeline_name: str, updates: dict) -> dict:
+    """
+    Update specific variables in the generated DAG file for a given pipeline.
+    For example, you can update schedule, table_name, folder_path, etc. without regenerating the whole DAG.
+    """
+    import re as _re
+
+    pipeline_id = _safe_id(pipeline_name)
+    file_path   = os.path.join(DAGS_FOLDER, f"pipeline_{pipeline_id}.py")
+
+    if not os.path.exists(file_path):
+        return {
+            "status": "FAILED",
+            "error":  f"Pipeline 'pipeline_{pipeline_id}' not found."
+        }
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    original_content = content
+    changed = []
+
+    # ── Mapping: field → DAG variable name ───────────────────────
+    field_map = {
+        "schedule":          "SCHEDULE",
+        "option":            "OPTION",
+        "table_name":        "TABLE_NAME",
+        "sync_mode":         "SYNC_MODE",
+        "incremental_column":"INCREMENTAL_COLUMN",
+        "folder_path":       "FOLDER_PATH",
+        "file_path":         "FILE_PATH",
+        "sheet_url":         "SHEET_URL",
+        "api_url":           "API_URL",
+        "after_first_run":   "AFTER_FIRST_RUN",
+        # Postgres
+        "src_pg_host":       "SRC_PG_HOST",
+        "src_pg_db":         "SRC_PG_DB",
+        "src_pg_user":       "SRC_PG_USER",
+        "src_pg_password":   "SRC_PG_PASSWORD",
+        "src_pg_port":       "SRC_PG_PORT",
+        "pg_query":          "PG_QUERY",
+        # S3
+        "s3_bucket":         "S3_BUCKET",
+        "s3_key":            "S3_KEY",
+        "s3_file_type":      "S3_FILE_TYPE",
+    }
+
+    for field, new_val in updates.items():
+        var = field_map.get(field)
+        if not var:
+            continue  # unknown field — skip
+
+        if new_val is None or str(new_val).strip() == "":
+            # None value → set to None in DAG
+            pattern     = rf'^({var}\s*=\s*).*$'
+            replacement = rf'\g<1>None'
+        else:
+            # String value → quoted
+            safe_val    = str(new_val).replace("\\", "\\\\").replace('"', '\\"')
+            pattern     = rf'^({var}\s*=\s*).*$'
+            replacement = rf'\g<1>"{safe_val}"'
+
+        new_content = _re.sub(pattern, replacement, content, flags=_re.MULTILINE)
+
+        if new_content != content:
+            changed.append(f"{var} → {new_val!r}")
+            content = new_content
+
+    if not changed:
+        return {
+            "status":  "NO_CHANGE",
+            "message": "No matching variables found or values already same.",
+            "pipeline": f"pipeline_{pipeline_id}",
+        }
+
+    # ── Write updated content ─────────────────────────────────────
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    return {
+        "status":   "SUCCESS",
+        "pipeline": f"pipeline_{pipeline_id}",
+        "changed":  changed,
+        "message":  f"{len(changed)} variable(s) updated. Airflow will reload in ~30s.",
+    }

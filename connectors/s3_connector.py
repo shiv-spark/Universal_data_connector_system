@@ -32,6 +32,10 @@ def s3_connector(bucket: str, key: str, file_type: str = "csv"):
 
             # All files merge to one DataFrame
             merged = pl.concat(dfs)
+            for col in merged.columns:
+                if merged[col].dtype in [pl.Object, pl.Struct, pl.List]:
+                    print(f"Converting complex column '{col}' to string to prevent DB errors.")
+                    merged = merged.with_columns(pl.col(col).cast(pl.Utf8))
             print(f"Total merged — {merged.shape[0]} rows x {merged.shape[1]} cols")
             return merged
 

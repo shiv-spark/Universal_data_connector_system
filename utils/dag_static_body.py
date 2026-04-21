@@ -16,9 +16,9 @@ load_dotenv()
 
 DB_CONFIG = {
     "host":     os.getenv("DB_HOST",     "postgres"),
-    "database": os.getenv("DB_NAME",     "postgres"),
-    "user":     os.getenv("DB_USER",     "postgres"),
-    "password": os.getenv("DB_PASSWORD", ""),
+    "database": os.getenv("DB_NAME",     "airflow"),
+    "user":     os.getenv("DB_USER",     "airflow"),
+    "password": os.getenv("DB_PASSWORD", "airflow"),
     "port":     os.getenv("DB_PORT",     "5432"),
 }
 
@@ -69,7 +69,7 @@ def _ensure_pipeline_folders():
 
 
 # ─────────────────────────────────────────────
-# HASH DEDUPLICATION — 3 naye functions
+# HASH DEDUPLICATION 
 # ─────────────────────────────────────────────
 
 def _get_file_hash(filepath):
@@ -301,7 +301,7 @@ def run_connector(**context):
                 file_hash = _get_file_hash(container_file)
 
                 if _hash_already_processed(file_hash, processed_dir):
-                    # Same content — skip, file wahi rehne do folder mein
+                    # Same content — keep the file in place (don't move to processed/), but skip ingestion and log it as skipped
                     print(f"SKIP: {os.path.basename(container_file)} (same content, already in DB)")
                     continue
 
@@ -362,11 +362,11 @@ def run_connector(**context):
                 region_name           = os.getenv("AWS_REGION", "us-east-1"),
             )
 
-            # ── Folder ya single file detect karo ────────────
+            # ── Detect Folder or single file ────────────
             is_folder = S3_KEY.endswith("/") or "." not in S3_KEY.split("/")[-1]
 
             if is_folder:
-                # ── Folder mode — CSV connector jaisa ────────
+                # ── Folder mode — like CSV connector  ────────
                 ext      = f".{S3_FILE_TYPE.lower().strip('.')}"
                 response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_KEY)
                 all_keys = [

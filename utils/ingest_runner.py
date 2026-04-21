@@ -34,7 +34,6 @@ def run_ingestion(connector_func, source, connector_name, *args,
         "S3Connector":           "s3",
     }
     connector_type = connector_type_map.get(connector_name, connector_name)
-    # file_name      = os.path.basename(source) if source and os.path.exists(source) else source
     file_name = os.path.basename(source) if (source and os.path.exists(source)) else (source[:50] if source else None)
     pipeline_id    = f"pipeline_{table_name}"
 

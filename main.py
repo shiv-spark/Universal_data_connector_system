@@ -1,4 +1,9 @@
 import re
+import httpx
+from pydantic import BaseModel
+from typing import Optional, List
+import httpx
+import os
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, Query, HTTPException
 from pydantic import BaseModel
@@ -20,7 +25,6 @@ from typing import List
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
-import os
 from datetime import datetime
 from connectors.postgres_connector import postgres_connector
 from connectors.s3_connector import s3_connector
@@ -127,7 +131,7 @@ def get_conn():
 
 @app.get("/")
 def root():
-    return {"message": "SparkBrains Data Connector API Running"}
+    return {"message": "SparkBrains Data Connector API Running — Ready to ingest data into Airflow pipelines!"}
 
 
 # ─────────────────────────────────────────────
@@ -217,6 +221,41 @@ def ingest_google_sheet(req: GoogleSheetRequest):
         sync_mode          = req.sync_mode,
         incremental_column = req.incremental_column,
     )
+# ─────────────────────────────────────────────
+# Multi-source Google Sheets
+# ─────────────────────────────────────────────
+
+class GoogleSheetMultiRequest(BaseModel):
+    file_path:  str              # URL file  path
+    option:     str
+    table_name: str | None = None
+    engine:     str        = "pandas"
+    sync_mode:  str        = "full"
+    incremental_column: str | None = None
+
+
+@app.post("/ingest_google_sheets_multi")
+def ingest_google_sheets_multi(req: GoogleSheetMultiRequest):
+    """
+    Read multiple Google Sheet URLs from a file and ingest all.
+    Supported: .txt, .csv, .json, .xlsx
+    """
+    validate_inputs(req.option, req.table_name)
+
+    from connectors.google_sheets_connector import google_sheets_multi_connector
+
+    return run_ingestion(
+        google_sheets_multi_connector,
+        req.file_path,
+        "GoogleSheetsMultiConnector",
+        req.file_path,
+        req.engine,
+        option             = req.option,
+        table_name         = req.table_name,
+        sync_mode          = req.sync_mode,
+        incremental_column = req.incremental_column,
+    )
+
 
 
 # ─────────────────────────────────────────────
@@ -458,11 +497,13 @@ def get_status(connector_type: str, dag_run_id: str):
 def get_all():
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM airflow_pipeline_runs ORDER BY created_at DESC")
-    data = cur.fetchall()
+    cur.execute("SELECT * FROM airflow_pipeline_runs ORDER BY created_at DESC LIMIT 50")
+    rows = cur.fetchall()
+    cols = [d[0] for d in cur.description]
     conn.close()
-    return data
- 
+    return [dict(zip(cols, r)) for r in rows]
+
+
 # ── Request model ────────────────────────────────────────────────────────────
 
 class CreatePipelineRequest(BaseModel):
@@ -562,6 +603,103 @@ def create_multi_pipeline(req: MultiSourcePipelineRequest):
 
     if result.get("status") == "FAILED":
         raise HTTPException(status_code=400, detail=result)
+
+    return result
+
+# ────────────────────────────────────────────
+# Edit existing pipeline
+# ────────────────────────────────────────────
+
+from utils.dag_generator import create_dag_file, delete_dag_file, list_dag_files, edit_dag_file
+
+class EditPipelineRequest(BaseModel):
+    # source config
+    folder_path:        Optional[str] = None
+    file_path:          Optional[str] = None
+    sheet_url:          Optional[str] = None
+    api_url:            Optional[str] = None
+    # scheduling
+    schedule:           Optional[str] = None
+    # load config
+    option:             Optional[str] = None
+    after_first_run:    Optional[str] = None
+    table_name:         Optional[str] = None
+    # sync
+    sync_mode:          Optional[str] = None
+    incremental_column: Optional[str] = None
+    # postgres
+    src_pg_host:        Optional[str] = None
+    src_pg_db:          Optional[str] = None
+    src_pg_user:        Optional[str] = None
+    src_pg_password:    Optional[str] = None
+    src_pg_port:        Optional[str] = None
+    pg_query:           Optional[str] = None
+    # s3
+    s3_bucket:          Optional[str] = None
+    s3_key:             Optional[str] = None
+    s3_file_type:       Optional[str] = None
+
+
+@app.patch("/edit_pipeline/{pipeline_name}")
+def edit_pipeline(pipeline_name: str, req: EditPipelineRequest):
+    """
+    Update variables of an existing DAG file without regenerating the whole DAG.
+    Only the fields you pass will be updated — rest remain unchanged.
+
+    Example:
+        PATCH /edit_pipeline/sales_data
+        { "schedule": "0 */6 * * *", "option": "2" }
+    """
+    # Only non-None fields pass in edit function 
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+
+    if not updates:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one field required for update."
+        )
+
+    # validate option if provided
+    if "option" in updates and updates["option"] not in ("1", "2", "3"):
+        raise HTTPException(
+            status_code=400,
+            detail="option '1' (append), '2' (overwrite), and '3' (create only) are valid."
+        )
+
+    # sync_mode validate if provided
+    if "sync_mode" in updates and updates["sync_mode"] not in ("full", "incremental"):
+        raise HTTPException(
+            status_code=400,
+            detail="sync_mode 'full' or 'incremental' is required."
+        )
+
+    result = edit_dag_file(pipeline_name, updates)
+
+    if result.get("status") == "FAILED":
+        raise HTTPException(status_code=404, detail=result)
+
+    # Update DB record if schedule, table_name, or operation (option) changed
+    try:
+        dag_id = f"pipeline_{pipeline_name}" if not pipeline_name.startswith("pipeline_") else pipeline_name
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            UPDATE airflow_pipeline_runs
+            SET    schedule      = COALESCE(%s, schedule),
+                   table_name    = COALESCE(%s, table_name),
+                   operation     = COALESCE(%s, operation)
+            WHERE  dag_id = %s
+        """, (
+            updates.get("schedule"),
+            updates.get("table_name"),
+            updates.get("option"),
+            dag_id,
+        ))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"DB update failed (non-critical): {e}")
 
     return result
 
@@ -1164,7 +1302,7 @@ def dashboard_summary():
                     / NULLIF(COUNT(*), 0), 1
                 )                                                     AS success_rate_pct
             FROM pipeline_metrics
-            WHERE logged_at >= NOW() - INTERVAL '24 hours'
+            WHERE logged_at >= NOW() - INTERVAL '7 days'
         """)
         metrics = dict(zip([d[0] for d in cur.description], cur.fetchone()))
 
@@ -1176,7 +1314,7 @@ def dashboard_summary():
                          AND logged_at >= NOW() - INTERVAL '1 hour') > 0
                     THEN 'DEGRADED'
                     WHEN COUNT(*) FILTER (WHERE status = 'FAILED'
-                         AND logged_at >= NOW() - INTERVAL '24 hours') > 3
+                         AND logged_at >= NOW() - INTERVAL '7 days') > 3
                     THEN 'WARNING'
                     ELSE 'HEALTHY'
                 END AS system_health
@@ -1345,3 +1483,359 @@ def health_check():
         "version":   "1.7"
     }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CHATBOT ENDPOINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ChatMessage(BaseModel):
+    role:    str   # "user" ya "assistant"
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages:      List[ChatMessage]
+    openrouter_key: str
+    model:         str = "mistralai/mistral-7b-instruct"
+    pipeline_name: Optional[str] = None   # specific pipeline ke logs chahiye to
+
+
+# ── DB context builder ────────────────────────────────────────────────────────
+
+def _build_db_context(pipeline_name: Optional[str] = None) -> str:
+    """
+    Create a context string by fetching relevant data from the database.
+    This context is provided to the LLM.
+    """
+    parts = []
+    conn  = get_conn()
+    cur   = conn.cursor()
+
+    try:
+        # ── 1. pipeline_runs — last 20 ───────────────────────────
+        cur.execute("""
+            SELECT run_id, connector_name, source, start_time, end_time,
+                   status, records_count, error
+            FROM pipeline_runs
+            ORDER BY start_time DESC
+            LIMIT 20
+        """)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        if rows:
+            lines = ["=== pipeline_runs (Last 20) ==="]
+            for r in rows:
+                rd = dict(zip(cols, r))
+                lines.append(
+                    f"run_id={rd['run_id']} | connector={rd['connector_name']} | "
+                    f"status={rd['status']} | rows={rd['records_count']} | "
+                    f"error={str(rd['error'] or '')[:100]} | "
+                    f"start={rd['start_time']} | end={rd['end_time']}"
+                )
+            parts.append("\n".join(lines))
+
+        # ── 2. pipeline_metrics — last 30 ────────────────────────
+        cur.execute("""
+            SELECT pipeline_id, table_name, rows_inserted, rows_skipped,
+                   rows_failed, duration_sec, evolved_columns, match_pct,
+                   connector_type, option, status, error_message, logged_at
+            FROM pipeline_metrics
+            ORDER BY logged_at DESC
+            LIMIT 30
+        """)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        if rows:
+            lines = ["=== pipeline_metrics (Last 30) ==="]
+            for r in rows:
+                rd = dict(zip(cols, r))
+                lines.append(
+                    f"pipeline={rd['pipeline_id']} | status={rd['status']} | "
+                    f"rows_inserted={rd['rows_inserted']} | "
+                    f"duration={rd['duration_sec']}s | "
+                    f"match_pct={rd['match_pct']}% | "
+                    f"connector={rd['connector_type']} | "
+                    f"evolved_cols={rd['evolved_columns']} | "
+                    f"error={str(rd['error_message'] or '')[:100]} | "
+                    f"time={rd['logged_at']}"
+                )
+            parts.append("\n".join(lines))
+
+        # ── 3. airflow_pipeline_runs — last 20 ───────────────────
+        cur.execute("""
+            SELECT dag_id, dag_run_id, pipeline_name, connector_type,
+                   operation, table_name, schedule, status,
+                   triggered_by, error_message, created_at
+            FROM airflow_pipeline_runs
+            ORDER BY created_at DESC
+            LIMIT 20
+        """)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        if rows:
+            lines = ["=== airflow_pipeline_runs (Last 20) ==="]
+            for r in rows:
+                rd = dict(zip(cols, r))
+                lines.append(
+                    f"dag={rd['dag_id']} | status={rd['status']} | "
+                    f"connector={rd['connector_type']} | "
+                    f"schedule={rd['schedule']} | "
+                    f"triggered_by={rd['triggered_by']} | "
+                    f"error={str(rd['error_message'] or '')[:100]} | "
+                    f"time={rd['created_at']}"
+                )
+            parts.append("\n".join(lines))
+
+        # ── 4. pipeline_logs — recent errors ─────────────────────
+        cur.execute("""
+            SELECT pl.run_id, pl.log_time, pl.level, pl.message
+            FROM pipeline_logs pl
+            WHERE pl.level = 'ERROR'
+            ORDER BY pl.log_time DESC
+            LIMIT 15
+        """)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        if rows:
+            lines = ["=== pipeline_logs (Recent ERRORS) ==="]
+            for r in rows:
+                rd = dict(zip(cols, r))
+                lines.append(
+                    f"run_id={rd['run_id']} | time={rd['log_time']} | "
+                    f"{rd['message'][:150]}"
+                )
+            parts.append("\n".join(lines))
+
+        # ── 5. pipeline_dag_logs — specific pipeline ya latest ───
+        if pipeline_name:
+            pid = pipeline_name if pipeline_name.startswith("pipeline_") else f"pipeline_{pipeline_name}"
+            cur.execute("""
+                SELECT pipeline_id, dag_run_id, task_id, status,
+                       log_content, log_file_path, created_at
+                FROM pipeline_dag_logs
+                WHERE pipeline_id = %s
+                ORDER BY created_at DESC
+                LIMIT 3
+            """, (pid,))
+        else:
+            cur.execute("""
+                SELECT pipeline_id, dag_run_id, task_id, status,
+                       log_content, log_file_path, created_at
+                FROM pipeline_dag_logs
+                ORDER BY created_at DESC
+                LIMIT 5
+            """)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        if rows:
+            lines = ["=== pipeline_dag_logs (Latest) ==="]
+            for r in rows:
+                rd = dict(zip(cols, r))
+                # Log content truncate karo — too long hota hai
+                log_snippet = str(rd['log_content'] or '')[:400]
+                lines.append(
+                    f"pipeline={rd['pipeline_id']} | "
+                    f"run={rd['dag_run_id']} | "
+                    f"status={rd['status']} | "
+                    f"time={rd['created_at']}\n"
+                    f"LOG_SNIPPET: {log_snippet}..."
+                )
+            parts.append("\n".join(lines))
+
+        # ── 6. Summary stats ──────────────────────────────────────
+        cur.execute("""
+            SELECT
+                COUNT(*)                                              AS total_runs,
+                COUNT(*) FILTER (WHERE status = 'SUCCESS')           AS success,
+                COUNT(*) FILTER (WHERE status = 'FAILED')            AS failed,
+                COUNT(*) FILTER (WHERE status = 'SKIPPED')           AS skipped,
+                COALESCE(SUM(rows_inserted), 0)                      AS total_rows,
+                ROUND(AVG(duration_sec)::numeric, 2)                 AS avg_duration,
+                ROUND(
+                    COUNT(*) FILTER (WHERE status = 'SUCCESS') * 100.0
+                    / NULLIF(COUNT(*), 0), 1
+                )                                                     AS success_rate
+            FROM pipeline_metrics
+            WHERE logged_at >= NOW() - INTERVAL '24 hours'
+        """)
+        row  = cur.fetchone()
+        cols = [d[0] for d in cur.description]
+        if row:
+            rd = dict(zip(cols, row))
+            parts.insert(0, f"""=== SYSTEM SUMMARY (Last 24h) ===
+Total Runs   : {rd['total_runs']}
+Success      : {rd['success']}
+Failed       : {rd['failed']}
+Skipped      : {rd['skipped']}
+Success Rate : {rd['success_rate']}%
+Total Rows   : {rd['total_rows']:,}
+Avg Duration : {rd['avg_duration']}s
+""")
+
+    except Exception as e:
+        parts.append(f"=== DB FETCH ERROR: {e} ===")
+    finally:
+        cur.close()
+        conn.close()
+
+    return "\n\n".join(parts)
+
+
+SYSTEM_PROMPT = """
+        You are the Pipeline Assistant for SparkBrains Universal Data Connector.
+
+        Your role:
+        Help users understand, debug, and monitor their data pipelines using the live database context.
+
+        Tone:
+        - Conversational, friendly, and clear (like a helpful teammate)
+        - Avoid robotic or overly formal responses
+        - Keep it concise but natural
+
+        Context:
+        You have access to:
+        - pipeline_runs: run_id, connector_name, status, records_count, error, start_time, end_time
+        - pipeline_logs: level (INFO/ERROR), message, timestamp, run_id
+        - pipeline_metrics: rows_inserted, duration_sec, match_pct, evolved_columns, connector_type, status, error_message
+        - airflow_pipeline_runs: dag_id, connector_type, schedule, status, triggered_by, error_message
+        - pipeline_dag_logs: pipeline_id, log_content, log_file_path, status, created_at
+
+        Guidelines:
+        - Always base answers strictly on the DB context — don’t assume missing data
+        - If no data is available, say clearly:
+        → "I couldn’t find any data for this — try running the pipeline first."
+
+        Response Style:
+        - Start with a short, natural explanation (1–2 lines)
+        - Then provide structured insights if needed:
+        - ✅ Status summary
+        - ⚠️ Issues (if any)
+        - 💡 Suggested fix (practical and actionable)
+        - Use bullet points, not long paragraphs
+        - Avoid sounding like logs or raw SQL output
+
+        Error Handling:
+        - Clearly explain the root cause in simple terms
+        - Suggest a fix like you would to a teammate (practical, not generic)
+
+        Formatting:
+        - Use Markdown (bold, bullets, small tables)
+        - Format numbers cleanly (e.g., 10,000 rows, 25 sec)
+
+        Length:
+        - Keep responses short and useful (100–250 words preferred)
+
+        Goal:
+        Make the user feel like they are chatting with a smart engineer, not reading a system report.
+        """
+
+
+# ── Endpoint ──────────────────────────────────────────────────────────────────
+
+@app.post("/chatbot")
+async def chatbot(req: ChatRequest):
+    """
+    Ask questions about your data pipelines and get insights.
+    It fetches live context from the database and generates answers using OpenRouter.
+
+    Request:
+        messages:       Chat history
+        openrouter_key: API key
+        model:          OpenRouter model name
+        pipeline_name:  Optional — For specific pipeline logs
+    """
+    # ── DB context fetch karo ─────────────────────────────────────
+    try:
+        db_context = _build_db_context(req.pipeline_name)
+    except Exception as e:
+        db_context = f"DB context fetch failed: {e}"
+
+    # ── Messages build  ───────────────────────────────────────
+    # IN Last user message inject context  
+    messages_for_llm = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    # History add  (last 8 messages)
+    history = req.messages[-8:]
+    for i, msg in enumerate(history):
+        if i == len(history) - 1 and msg.role == "user":
+            # DB context inject in the last user message
+            messages_for_llm.append({
+                "role": "user",
+                "content": f"""User ka sawaal: {msg.content}
+
+--- DATABASE CONTEXT (Live Data from PostgreSQL) ---
+{db_context}
+--- END CONTEXT ---
+Present your answer clearly and concisely based on the live data provided above. 
+If the context doesn't have the answer, say "Data not found in context" instead of making assumptions."""
+            })
+        else:
+            messages_for_llm.append({
+                "role":    msg.role,
+                "content": msg.content,
+            })
+
+    # ── OpenRouter call ───────────────────────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {req.openrouter_key}",
+                    "Content-Type":  "application/json",
+                    "HTTP-Referer":  "http://localhost:8000",
+                    "X-Title":       "SparkBrains Pipeline Assistant",
+                },
+                json={
+                    "model":       req.model,
+                    "messages":    messages_for_llm,
+                    "max_tokens":  1200,
+                    "temperature": 0.3,
+                },
+            )
+
+        if response.status_code == 200:
+            data   = response.json()
+            answer = data["choices"][0]["message"]["content"]
+            return {
+                "status":  "SUCCESS",
+                "answer":  answer,
+                "model":   req.model,
+                "context_length": len(db_context),
+            }
+        elif response.status_code == 401:
+            raise HTTPException(status_code=401, detail="Invalid OpenRouter API key.")
+        elif response.status_code == 429:
+            raise HTTPException(status_code=429, detail="OpenRouter rate limit. Wait.")
+        else:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"OpenRouter error: {response.text[:300]}"
+            )
+
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="OpenRouter request timeout.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Chatbot error: {str(e)}")
+
+
+# ── Simple context-only endpoint (bina LLM ke) ───────────────────────────────
+
+@app.get("/chatbot/context")
+def get_chatbot_context(pipeline_name: Optional[str] = None):
+    """
+    Debug  — See what context is available.
+    GET /chatbot/context
+    GET /chatbot/context?pipeline_name=spark1
+    """
+    try:
+        context = _build_db_context(pipeline_name)
+        return {
+            "status":         "SUCCESS",
+            "pipeline_name":  pipeline_name,
+            "context_length": len(context),
+            "context":        context,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

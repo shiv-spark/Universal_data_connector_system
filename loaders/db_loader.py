@@ -165,7 +165,7 @@ def check_schema_mismatch(cursor, df, table_name):
     print(f"Extra     : {sorted(extra_in_file)}  → new columns will be added")
     print(f"Match %   : {match_pct}%")
 
-    if match_pct < 50:
+    if match_pct < 80:
         print(f"WARNING: Only {match_pct}% columns match — filling many NULLs and adding many new columns may indicate a wrong file or bad mapping. Please verify.")
 
     return {
@@ -408,7 +408,7 @@ def load_to_db(df, option=None, table_name=None,
         # ── INCREMENTAL FILTER ───────────────────────────
         if sync_mode == "incremental" and incremental_column:
 
-            # column exist karta hai df mein?
+            # column existing in df?
             if incremental_column not in df.columns:
                 raise ValueError(
                     f"incremental_column '{incremental_column}' "
@@ -441,16 +441,74 @@ def load_to_db(df, option=None, table_name=None,
         # ────────────────────────────────────────────────
 
         # ── OPTION 1 — APPEND ────────────────────────────
+        
         if option == "1":
             if not table_exists(cursor, table_name):
                 create_table(cursor, df, table_name)
             else:
                 report    = check_schema_mismatch(cursor, df, table_name)
                 match_pct = report["match_pct"]
-                if report["match_pct"] == 0:
-                    raise ValueError("0% column match — verify karo.")
-                evolved_cols = evolve_schema(cursor, df, table_name)
+
+                # ── THRESHOLD 1: 0% match — hard stop ──────────────
+                if match_pct == 0:
+                    raise ValueError(
+                        f"0% column match — Seems like a different file. "
+                        f"DB columns: {report['matched']} | "
+                        f"File columns: {list(df.columns)}"
+                    )
+
+                # ── THRESHOLD 2: < 50% match — warn but allow ──────
+                if match_pct < 50:
+                    print(
+                        f"WARNING: Only {match_pct}% columns match . "
+                        f"Missing: {report['missing_in_file']} | "
+                        f"Extra: {report['extra_in_file']}"
+                    )
+                    #If the user explicitly wants to proceed even with a low match,
+                    #then still continue the process — but clearly log a warning message.
+
+                # ── THRESHOLD 3: New columns add Only 80%+ match ──
+                if match_pct >= 80:
+                    # High confidence — add new columns automatically
+                    evolved_cols = evolve_schema(cursor, df, table_name)
+                    if evolved_cols:
+                        print(f"Schema evolved ({match_pct}% match): {evolved_cols}")
+
+                elif 50 <= match_pct < 80:
+                    # Medium confidence — add new columns but log a caution
+                    evolved_cols = evolve_schema(cursor, df, table_name)
+                    print(
+                        f"CAUTION: Schema evolved at only {match_pct}% match. "
+                        f"New columns added: {evolved_cols}. "
+                        f"Verify the file."
+                    )
+
+                else:
+                    # < 50% match — Not add new columns, just insert matching columns with a warning, because it's likely a wrong file or bad mapping.
+                    evolved_cols = []
+                    print(
+                        f"Schema evolution SKIPPED: {match_pct}% match too low. "
+                        f"Only matching columns will be inserted."
+                    )
+                    # Trim df to only matched columns, to avoid inserting wrong data into the table. This is a safety measure when the match percentage is low, indicating a potential mismatch between the file and the table schema. By only inserting the matched columns, we can minimize the risk of corrupting the existing data with incorrect or unexpected columns from the file.
+                    matched_cols = list(report["matched"])
+                    if isinstance(df, pl.DataFrame):
+                        df = df.select(matched_cols)
+                    else:
+                        df = df[matched_cols]
+
             insert_data(cursor, df, table_name)
+
+        # if option == "1":
+        #     if not table_exists(cursor, table_name):
+        #         create_table(cursor, df, table_name)
+        #     else:
+        #         report    = check_schema_mismatch(cursor, df, table_name)
+        #         match_pct = report["match_pct"]
+        #         if report["match_pct"] == 0:
+        #             raise ValueError("0% column match — verify karo.")
+        #         evolved_cols = evolve_schema(cursor, df, table_name)
+        #     insert_data(cursor, df, table_name)
 
         # ── OPTION 2 — OVERWRITE ─────────────────────────
         elif option == "2":
